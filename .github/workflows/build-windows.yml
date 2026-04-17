@@ -1,4 +1,4 @@
-name: Build Windows Installer
+name: Build Windows Portable
 
 on:
   push:
@@ -11,30 +11,70 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install dependencies
+      - name: Download Python embeddable
+        shell: pwsh
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install pywebview pyinstaller pillow
+          $pyVer = "3.11.9"
+          Invoke-WebRequest -Uri "https://www.python.org/ftp/python/$pyVer/python-$pyVer-embed-amd64.zip" -OutFile python-embed.zip
+          New-Item -ItemType Directory -Path OceanShare\python -Force | Out-Null
+          Expand-Archive python-embed.zip -DestinationPath OceanShare\python -Force
 
-      - name: Convert icon to .ico
+      - name: Enable site-packages in embedded Python
+        shell: pwsh
         run: |
-          python -c "from PIL import Image; img = Image.open('ocean-icon.jpg').convert('RGBA'); img.save('icon.ico', format='ICO', sizes=[(16,16),(32,32),(48,48),(64,64),(128,128),(256,256)])"
+          $pthFile = Get-ChildItem OceanShare\python\python*._pth | Select-Object -First 1
+          (Get-Content $pthFile.FullName) -replace '#import site', 'import site' | Set-Content $pthFile.FullName
 
-      - name: Build OceanShare.exe
-        run: pyinstaller --clean --noconfirm surfshare.spec
-
-      - name: Build installer (Inno Setup)
+      - name: Bootstrap pip
+        shell: pwsh
         run: |
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+          Invoke-WebRequest -Uri https://bootstrap.pypa.io/get-pip.py -OutFile get-pip.py
+          .\OceanShare\python\python.exe get-pip.py --no-warn-script-location
 
-      - name: Upload installer
+      - name: Install pywebview
+        shell: pwsh
+        run: |
+          .\OceanShare\python\python.exe -m pip install --no-warn-script-location pywebview
+
+      - name: Copy app files
+        shell: pwsh
+        run: |
+          Copy-Item surfshare.py OceanShare\
+          Copy-Item ocean-icon.jpg OceanShare\
+
+      - name: Create run.bat
+        shell: pwsh
+        run: |
+          $bat = @"
+          @echo off
+          cd /d `"%~dp0`"
+          start `"`" `"%~dp0python\pythonw.exe`" `"%~dp0surfshare.py`"
+          "@
+          $bat | Out-File -Encoding ASCII OceanShare\run.bat
+
+      - name: Create README
+        shell: pwsh
+        run: |
+          $readme = @"
+          OceanShare - Como usar
+
+          1. Extraia esta pasta para algum lugar (Ex: Documentos)
+          2. De duplo clique em run.bat
+          3. Uma janela do OceanShare vai abrir
+
+          Para criar um atalho na area de trabalho:
+          Clique com botao direito em run.bat -> Enviar para -> Area de trabalho
+          "@
+          $readme | Out-File -Encoding UTF8 OceanShare\LEIA-ME.txt
+
+      - name: Zip it
+        shell: pwsh
+        run: |
+          Compress-Archive -Path OceanShare -DestinationPath OceanShare-Portable.zip -Force
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: OceanShare-Windows-Installer
-          path: installer-output/OceanShare-Setup.exe
+          name: OceanShare-Windows-Portable
+          path: OceanShare-Portable.zip
           if-no-files-found: error

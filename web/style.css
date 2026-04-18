@@ -142,7 +142,28 @@ input[type="text"]:focus { outline: none; border-color: var(--ocean); }
 .share-url {
   color: var(--muted);
   font-size: 0.9rem;
-  margin-bottom: 4px;
+  margin-bottom: 8px;
+  text-align: center;
+}
+
+.qr-wrap {
+  display: flex;
+  justify-content: center;
+  padding: 12px;
+  background: white;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  margin-bottom: 12px;
+}
+.qr-wrap canvas { display: block; max-width: 100%; height: auto !important; }
+
+.file-thumb {
+  width: 48px;
+  height: 48px;
+  border-radius: 6px;
+  object-fit: cover;
+  background: var(--bg);
+  flex-shrink: 0;
 }
 .link-box {
   background: var(--bg);
@@ -176,6 +197,7 @@ input[type="text"]:focus { outline: none; border-color: var(--ocean); }
   margin-bottom: 16px;
 }
 .conn-info.lan { background: #d4f5e0; color: #1a7a42; }
+.conn-info.same-nat { background: #d4f5e0; color: #1a7a42; }
 .conn-info.internet { background: #fef3c7; color: #8a6d0e; }
 
 .peers {
@@ -210,6 +232,15 @@ input[type="text"]:focus { outline: none; border-color: var(--ocean); }
 .file-item:last-child { border-bottom: none; }
 .file-item:hover { background: var(--bg); }
 .file-icon { font-size: 1.5rem; }
+.file-slot {
+  font-size: 1.8rem;
+  width: 48px;
+  height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
 .file-meta { flex: 1; min-width: 0; }
 .file-name { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .file-size { color: var(--muted); font-size: 0.85rem; }

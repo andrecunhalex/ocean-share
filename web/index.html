@@ -33,7 +33,8 @@
         <div class="code-label">Código para conectar:</div>
         <div class="code" id="hostCode">----</div>
       </div>
-      <p class="share-url">Ou abra este link no outro dispositivo:</p>
+      <p class="share-url">Ou escaneie o QR / abra o link no outro dispositivo:</p>
+      <div class="qr-wrap"><canvas id="hostQr"></canvas></div>
       <div class="link-box" id="hostLink">—</div>
       <div id="hostStatus" class="status">Aguardando...</div>
       <div id="hostPeers" class="peers"></div>
@@ -69,6 +70,7 @@
 </footer>
 
 <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

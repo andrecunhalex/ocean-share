@@ -3,10 +3,11 @@
 
 const CHUNK_SIZE = 16 * 1024;
 const BUFFER_THRESHOLD = 1024 * 1024; // 1MB
-const EXTENSIONS_VIDEO = ['.mp4','.mov','.avi','.mkv','.m4v','.wmv','.webm'];
-const EXTENSIONS_IMG = ['.jpg','.jpeg','.png','.heic','.gif'];
-const EXTENSIONS_OTHER = ['.mp3','.pdf','.zip','.rar'];
-const EXTENSIONS = [...EXTENSIONS_VIDEO, ...EXTENSIONS_IMG, ...EXTENSIONS_OTHER];
+const THUMB_SIZE = 120;
+const EXTENSIONS_VIDEO = ['.mp4','.mov','.avi','.mkv','.m4v','.wmv','.webm','.flv','.mpg','.mpeg','.3gp'];
+const EXTENSIONS_IMG = ['.jpg','.jpeg','.png','.gif','.webp','.bmp','.svg','.heic','.heif','.avif','.tiff','.tif'];
+const EXTENSIONS_AUDIO = ['.mp3','.wav','.ogg','.flac','.m4a','.aac','.opus'];
+const PREVIEWABLE_IMG = ['.jpg','.jpeg','.png','.gif','.webp','.bmp','.avif']; // browsers can decode these
 
 const $ = (id) => document.getElementById(id);
 const views = ['home','host','join','files'];
@@ -21,14 +22,26 @@ function fmtSize(b) {
   return `${b.toFixed(1)} ${units[i]}`;
 }
 
+function fileExt(name) {
+  const i = name.lastIndexOf('.');
+  return i >= 0 ? name.slice(i).toLowerCase() : '';
+}
+
 function fileIcon(name) {
-  const ext = '.' + name.split('.').pop().toLowerCase();
+  const ext = fileExt(name);
   if (EXTENSIONS_VIDEO.includes(ext)) return '🎬';
   if (EXTENSIONS_IMG.includes(ext)) return '🖼️';
-  if (ext === '.mp3') return '🎵';
+  if (EXTENSIONS_AUDIO.includes(ext)) return '🎵';
   if (ext === '.pdf') return '📄';
-  if (ext === '.zip' || ext === '.rar') return '🗜️';
+  if (['.zip','.rar','.7z','.tar','.gz'].includes(ext)) return '🗜️';
+  if (['.doc','.docx','.odt','.txt','.rtf'].includes(ext)) return '📝';
+  if (['.xls','.xlsx','.ods','.csv'].includes(ext)) return '📊';
+  if (['.ppt','.pptx','.odp','.key'].includes(ext)) return '📽️';
   return '📎';
+}
+
+function isPreviewable(name) {
+  return PREVIEWABLE_IMG.includes(fileExt(name));
 }
 
 // Generate random 4-digit code
@@ -36,21 +49,27 @@ function randomCode() {
   return String(Math.floor(1000 + Math.random() * 9000));
 }
 
-// Detect if peer connection is using LAN or internet
+// Detect if peer connection is using LAN, same network (same public IP), or internet
 async function detectConnectionType(peerConn) {
   try {
     const stats = await peerConn.getStats();
-    let localType = '', remoteType = '';
-    stats.forEach(s => {
-      if (s.type === 'candidate-pair' && s.state === 'succeeded' && s.nominated) {
-        stats.forEach(c => {
-          if (c.id === s.localCandidateId) localType = c.candidateType;
-          if (c.id === s.remoteCandidateId) remoteType = c.candidateType;
-        });
-      }
-    });
-    // 'host' = direct LAN, 'srflx' = via STUN (internet), 'relay' = via TURN
-    if (localType === 'host' && remoteType === 'host') return 'lan';
+    const all = [];
+    stats.forEach(s => all.push(s));
+    const pair = all.find(s => s.type === 'candidate-pair' && s.state === 'succeeded' && (s.nominated || s.selected));
+    if (!pair) return 'unknown';
+    const local = all.find(s => s.id === pair.localCandidateId);
+    const remote = all.find(s => s.id === pair.remoteCandidateId);
+    if (!local || !remote) return 'unknown';
+
+    // Direct LAN: both peers sent local addresses directly
+    if (local.candidateType === 'host' && remote.candidateType === 'host') return 'lan';
+
+    // If both share same public IP (srflx), they're behind same NAT = same network
+    const localSrflx = all.find(s => (s.type === 'local-candidate' || s.type === 'candidate') && s.candidateType === 'srflx');
+    const remoteSrflx = all.find(s => s.type === 'remote-candidate' && s.candidateType === 'srflx');
+    if (localSrflx && remoteSrflx && localSrflx.address && localSrflx.address === remoteSrflx.address) {
+      return 'same-nat';
+    }
     return 'internet';
   } catch (e) {
     return 'unknown';
@@ -99,8 +118,6 @@ async function scanDirectory(dirHandle, prefix = '') {
     if (entry.name.startsWith('.')) continue;
     const relPath = prefix ? `${prefix}/${entry.name}` : entry.name;
     if (entry.kind === 'file') {
-      const ext = '.' + entry.name.split('.').pop().toLowerCase();
-      if (!EXTENSIONS.includes(ext)) continue;
       try {
         const file = await entry.getFile();
         files.set(relPath, { name: entry.name, path: relPath, size: file.size, handle: entry });
@@ -124,7 +141,9 @@ async function initHostPeer() {
       $('hostCode').textContent = candidate;
       const url = new URL(location.href);
       url.hash = `#${candidate}`;
-      $('hostLink').textContent = url.toString();
+      const urlStr = url.toString();
+      $('hostLink').textContent = urlStr;
+      renderQR(urlStr);
       $('hostStatus').textContent = 'Aguardando conexões... (código pronto)';
       $('hostStatus').className = 'status ok';
       return;
@@ -192,7 +211,40 @@ async function handleHostMessage(conn, msg) {
     conn.send({ type: 'files', folder: hostState.folderHandle.name, files: arr });
   } else if (msg.type === 'get') {
     await sendFileToGuest(conn, msg.path);
+  } else if (msg.type === 'preview') {
+    await sendPreviewToGuest(conn, msg.path);
   }
+}
+
+async function sendPreviewToGuest(conn, path) {
+  const entry = hostState.files.get(path);
+  if (!entry || !isPreviewable(entry.name)) {
+    conn.send({ type: 'preview_data', path, dataUrl: null });
+    return;
+  }
+  try {
+    const file = await entry.handle.getFile();
+    const bitmap = await createImageBitmap(file);
+    const ratio = Math.min(THUMB_SIZE / bitmap.width, THUMB_SIZE / bitmap.height, 1);
+    const w = Math.max(1, Math.round(bitmap.width * ratio));
+    const h = Math.max(1, Math.round(bitmap.height * ratio));
+    const canvas = document.createElement('canvas');
+    canvas.width = w; canvas.height = h;
+    canvas.getContext('2d').drawImage(bitmap, 0, 0, w, h);
+    bitmap.close?.();
+    const dataUrl = canvas.toDataURL('image/jpeg', 0.7);
+    conn.send({ type: 'preview_data', path, dataUrl });
+  } catch (e) {
+    conn.send({ type: 'preview_data', path, dataUrl: null });
+  }
+}
+
+function renderQR(url) {
+  const canvas = $('hostQr');
+  if (!canvas || typeof QRCode === 'undefined') return;
+  QRCode.toCanvas(canvas, url, { width: 200, margin: 1, color: { dark: '#005a8f', light: '#ffffff' } }, (err) => {
+    if (err) console.error('qr error', err);
+  });
 }
 
 async function sendFileToGuest(conn, path) {
@@ -242,6 +294,9 @@ let guestState = {
   hostCode: null,
   files: [],
   activeTransfer: null, // { path, name, size, chunks: [], received: 0 }
+  previews: new Map(),
+  previewsRequested: new Set(),
+  previewsPending: 0,
 };
 
 function showJoin(prefillCode) {
@@ -281,10 +336,13 @@ async function connectAsGuest() {
         const type = await detectConnectionType(conn.peerConnection);
         const info = $('connInfo');
         if (type === 'lan') {
-          info.textContent = '✓ Conectado pela rede local — transferência não usa internet';
+          info.textContent = '✓ Conectado pela rede local — transferência direta via LAN';
           info.className = 'conn-info lan';
+        } else if (type === 'same-nat') {
+          info.textContent = '✓ Mesma rede detectada — tráfego fica no roteador, não vai pra internet';
+          info.className = 'conn-info same-nat';
         } else if (type === 'internet') {
-          info.textContent = '🌐 Conectado via internet — transferência P2P direta';
+          info.textContent = '🌐 Conectado via internet — P2P direto, sem servidor no meio';
           info.className = 'conn-info internet';
         } else {
           info.textContent = '🔗 Conectado';
@@ -320,9 +378,17 @@ async function connectAsGuest() {
 function handleGuestMessage(msg) {
   if (msg.type === 'files') {
     guestState.files = msg.files;
+    guestState.previews = new Map();
     $('filesTitle').textContent = `Arquivos em 📁 ${msg.folder}`;
     renderFiles();
     showView('files');
+    requestPreviews();
+  } else if (msg.type === 'preview_data') {
+    if (msg.dataUrl) guestState.previews.set(msg.path, msg.dataUrl);
+    else guestState.previews.set(msg.path, null);
+    updateFileThumbnail(msg.path);
+    guestState.previewsPending--;
+    requestPreviews();
   } else if (msg.type === 'start') {
     guestState.activeTransfer = {
       path: msg.path, name: msg.name, size: msg.size,
@@ -367,8 +433,8 @@ function renderFiles() {
     return;
   }
   list.innerHTML = guestState.files.map((f, idx) => `
-    <div class="file-item" data-idx="${idx}">
-      <span class="file-icon">${fileIcon(f.name)}</span>
+    <div class="file-item" data-idx="${idx}" data-path="${escapeHtml(f.path)}">
+      <span class="file-slot">${fileIcon(f.name)}</span>
       <div class="file-meta">
         <div class="file-name">${escapeHtml(f.name)}</div>
         <div class="file-size">${fmtSize(f.size)}</div>
@@ -382,6 +448,29 @@ function renderFiles() {
       requestDownload(guestState.files[idx]);
     });
   });
+}
+
+function updateFileThumbnail(path) {
+  const dataUrl = guestState.previews.get(path);
+  if (!dataUrl) return;
+  const item = $('fileList').querySelector(`.file-item[data-path="${CSS.escape(path)}"] .file-slot`);
+  if (item) {
+    item.innerHTML = `<img class="file-thumb" src="${dataUrl}" alt="">`;
+  }
+}
+
+function requestPreviews() {
+  if (!guestState.conn || !guestState.files) return;
+  const MAX_PARALLEL = 3;
+  guestState.previewsPending = guestState.previewsPending || 0;
+  while (guestState.previewsPending < MAX_PARALLEL) {
+    const next = guestState.files.find(f => isPreviewable(f.name) && !guestState.previews.has(f.path) && !guestState.previewsRequested?.has(f.path));
+    if (!next) return;
+    guestState.previewsRequested = guestState.previewsRequested || new Set();
+    guestState.previewsRequested.add(next.path);
+    guestState.previewsPending++;
+    guestState.conn.send({ type: 'preview', path: next.path });
+  }
 }
 
 function requestDownload(file) {
@@ -411,7 +500,7 @@ function renderTransfers() {
 function disconnectGuest() {
   if (guestState.conn) guestState.conn.close();
   if (guestState.peer) guestState.peer.destroy();
-  guestState = { peer: null, conn: null, hostCode: null, files: [], activeTransfer: null };
+  guestState = { peer: null, conn: null, hostCode: null, files: [], activeTransfer: null, previews: new Map(), previewsRequested: new Set(), previewsPending: 0 };
   showView('home');
 }
 

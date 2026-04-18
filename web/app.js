@@ -405,6 +405,7 @@ function stopHost() {
 const guestState = {
   peer: null, conn: null, hostCode: null, folder: '',
   files: [],
+  currentPath: '',
   previews: new Map(),
   previewsRequested: new Set(),
   previewsPending: 0,
@@ -418,6 +419,7 @@ function resetGuest() {
   guestState.peer = null; guestState.conn = null;
   guestState.hostCode = null; guestState.folder = '';
   guestState.files = [];
+  guestState.currentPath = '';
   guestState.previews = new Map();
   guestState.previewsRequested = new Set();
   guestState.previewsPending = 0;
@@ -503,7 +505,9 @@ function handleGuestMessage(msg) {
   if (msg.type === 'files') {
     guestState.files = msg.files;
     guestState.folder = msg.folder;
+    guestState.currentPath = '';
     $('filesTitle').textContent = `Arquivos em “${msg.folder}”`;
+    renderBreadcrumb();
     renderFiles();
     showView('files');
     requestPreviews();
@@ -587,19 +591,90 @@ function processQueue() {
 
 // Files rendering
 
+function getViewItems() {
+  const cur = guestState.currentPath;
+  const prefix = cur ? cur + '/' : '';
+  const folderCounts = new Map();
+  const files = [];
+  for (const f of guestState.files) {
+    if (prefix && !f.path.startsWith(prefix)) continue;
+    const rest = f.path.slice(prefix.length);
+    const slash = rest.indexOf('/');
+    if (slash >= 0) {
+      const folderName = rest.slice(0, slash);
+      folderCounts.set(folderName, (folderCounts.get(folderName) || 0) + 1);
+    } else {
+      files.push(f);
+    }
+  }
+  const folders = Array.from(folderCounts.entries())
+    .map(([name, count]) => ({ name, count }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  files.sort((a, b) => a.name.localeCompare(b.name));
+  return { folders, files };
+}
+
+function renderBreadcrumb() {
+  const bc = $('breadcrumb');
+  if (!guestState.folder) { bc.innerHTML = ''; return; }
+  const parts = guestState.currentPath ? guestState.currentPath.split('/') : [];
+  let html = `<a data-path="" class="${parts.length === 0 ? 'current' : ''}">
+    <iconify-icon icon="mdi:folder-home"></iconify-icon>
+    ${escapeHtml(guestState.folder)}
+  </a>`;
+  let accum = '';
+  parts.forEach((p, i) => {
+    accum = accum ? accum + '/' + p : p;
+    const isLast = i === parts.length - 1;
+    html += `<iconify-icon icon="mdi:chevron-right"></iconify-icon>
+      <a data-path="${escapeHtml(accum)}" class="${isLast ? 'current' : ''}">${escapeHtml(p)}</a>`;
+  });
+  bc.innerHTML = html;
+  bc.querySelectorAll('a').forEach(el => {
+    el.addEventListener('click', () => goToPath(el.dataset.path));
+  });
+}
+
+function goToPath(path) {
+  guestState.currentPath = path;
+  renderBreadcrumb();
+  renderFiles();
+}
+
+function enterFolder(name) {
+  const newPath = guestState.currentPath ? guestState.currentPath + '/' + name : name;
+  goToPath(newPath);
+}
+
 function renderFiles() {
   const list = $('fileList');
-  if (guestState.files.length === 0) {
-    list.innerHTML = '<div class="file-empty">Nenhum arquivo disponível</div>';
+  const { folders, files } = getViewItems();
+  if (folders.length === 0 && files.length === 0) {
+    list.innerHTML = '<div class="file-empty">Pasta vazia</div>';
     updateSelectBar();
     return;
   }
-  list.innerHTML = guestState.files.map((f, idx) => {
+  let html = '';
+  folders.forEach(fol => {
+    html += `
+      <div class="file-item folder-entry" data-folder="${escapeHtml(fol.name)}">
+        <div class="file-slot">
+          <iconify-icon icon="mdi:folder"></iconify-icon>
+        </div>
+        <div class="file-meta">
+          <div class="file-name">${escapeHtml(fol.name)}</div>
+          <div class="folder-count">${fol.count} arquivo${fol.count > 1 ? 's' : ''}</div>
+        </div>
+        <iconify-icon icon="mdi:chevron-right" style="color:var(--text-3);font-size:20px"></iconify-icon>
+      </div>
+    `;
+  });
+  files.forEach((f) => {
     const isSel = guestState.selected.has(f.path);
     const isDl = guestState.downloaded.has(f.path);
     const previewable = isPreviewable(f.name) || isAudio(f.name);
-    return `
-      <div class="file-item ${isSel ? 'selected' : ''} ${isDl ? 'downloaded' : ''}" data-path="${escapeHtml(f.path)}" data-idx="${idx}">
+    html += `
+      <div class="file-item ${isSel ? 'selected' : ''} ${isDl ? 'downloaded' : ''}" data-path="${escapeHtml(f.path)}">
         <div class="file-chk" data-act="select">
           <iconify-icon icon="mdi:check"></iconify-icon>
         </div>
@@ -617,8 +692,13 @@ function renderFiles() {
         </div>
       </div>
     `;
-  }).join('');
-  list.querySelectorAll('.file-item').forEach(el => {
+  });
+  list.innerHTML = html;
+
+  list.querySelectorAll('.file-item.folder-entry').forEach(el => {
+    el.addEventListener('click', () => enterFolder(el.dataset.folder));
+  });
+  list.querySelectorAll('.file-item:not(.folder-entry)').forEach(el => {
     el.addEventListener('click', (e) => {
       const target = e.target.closest('[data-act]');
       const act = target?.dataset.act;

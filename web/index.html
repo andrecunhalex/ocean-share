@@ -2,75 +2,135 @@
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="theme-color" content="#080c18">
 <title>OceanShare 🌊</title>
 <link rel="stylesheet" href="style.css">
 <link rel="icon" href="ocean-icon.jpg">
 </head>
 <body>
+<div class="bg">
+  <div class="orb"></div>
+  <div class="orb"></div>
+  <div class="orb"></div>
+</div>
+
 <header>
-  <h1>OceanShare 🌊</h1>
-  <p class="tagline">Compartilhamento direto entre dispositivos</p>
+  <div class="brand">
+    <img src="ocean-icon.jpg" alt="" class="brand-logo">
+    <h1>OceanShare</h1>
+  </div>
+  <p class="tagline">Compartilhamento P2P direto entre dispositivos</p>
 </header>
 
 <main>
   <!-- Tela inicial: escolher modo -->
   <section id="home" class="view">
-    <div class="card">
+    <div class="card glass">
       <h2>O que você quer fazer?</h2>
-      <button id="btnHost" class="primary big">📂 Compartilhar uma pasta</button>
-      <button id="btnJoin" class="secondary big">⬇ Receber arquivos</button>
+      <button id="btnHost" class="btn btn-go big">
+        <iconify-icon icon="mdi:folder-upload"></iconify-icon>
+        <span>Compartilhar uma pasta</span>
+      </button>
+      <button id="btnJoin" class="btn btn-folder big">
+        <iconify-icon icon="mdi:download-circle-outline"></iconify-icon>
+        <span>Receber arquivos</span>
+      </button>
     </div>
     <p class="hint">Use Chrome ou Edge no computador que vai <b>compartilhar</b> a pasta.</p>
   </section>
 
   <!-- Host: compartilhando -->
   <section id="host" class="view hidden">
-    <div class="card">
-      <h2>Sua pasta está online</h2>
-      <p class="folder-name" id="hostFolderName">—</p>
+    <div class="card glass">
+      <div class="folder-card">
+        <iconify-icon icon="mdi:folder" class="folder-icon"></iconify-icon>
+        <div class="folder-meta">
+          <div class="lbl">Pasta compartilhada</div>
+          <div class="fpath" id="hostFolderName">—</div>
+        </div>
+      </div>
+
       <div class="code-box">
         <div class="code-label">Código para conectar:</div>
         <div class="code" id="hostCode">----</div>
       </div>
+
       <p class="share-url">Ou escaneie o QR / abra o link no outro dispositivo:</p>
       <div class="qr-wrap"><canvas id="hostQr"></canvas></div>
       <div class="link-box" id="hostLink">—</div>
+
       <div id="hostStatus" class="status">Aguardando...</div>
       <div id="hostPeers" class="peers"></div>
-      <button id="btnStop" class="danger">Parar de compartilhar</button>
+
+      <button id="btnStop" class="btn btn-stop">
+        <iconify-icon icon="mdi:stop-circle-outline"></iconify-icon>
+        <span>Parar de compartilhar</span>
+      </button>
     </div>
   </section>
 
   <!-- Guest: conectando -->
   <section id="join" class="view hidden">
-    <div class="card">
+    <div class="card glass">
       <h2>Digite o código</h2>
       <input type="text" id="joinCode" maxlength="6" placeholder="1234" autocomplete="off" inputmode="numeric">
-      <button id="btnConnect" class="primary big">Conectar</button>
-      <button id="btnJoinBack" class="link">← Voltar</button>
+      <button id="btnConnect" class="btn btn-go big">
+        <iconify-icon icon="mdi:link-variant"></iconify-icon>
+        <span>Conectar</span>
+      </button>
+      <button id="btnJoinBack" class="btn-link">← Voltar</button>
       <div id="joinStatus" class="status"></div>
     </div>
   </section>
 
-  <!-- Guest conectado: lista de arquivos -->
+  <!-- Guest conectado: lista -->
   <section id="files" class="view hidden">
-    <div class="card">
+    <div class="card glass">
       <div class="conn-info" id="connInfo"></div>
       <h2 id="filesTitle">Arquivos disponíveis</h2>
       <div class="file-list" id="fileList"></div>
+
+      <div id="selectBar" class="select-bar hidden">
+        <div class="sel-count"><span id="selCount">0</span> selecionado(s)</div>
+        <button id="btnSelClear" class="sel-btn">Limpar</button>
+        <button id="btnSelDownload" class="sel-btn primary">
+          <iconify-icon icon="mdi:download"></iconify-icon>
+          <span>Baixar</span>
+        </button>
+      </div>
+
       <div id="transfers" class="transfers"></div>
-      <button id="btnDisconnect" class="danger">Desconectar</button>
+      <button id="btnDisconnect" class="btn-link danger">Desconectar</button>
     </div>
   </section>
 </main>
 
+<!-- Modal de preview -->
+<div id="modal" class="modal hidden">
+  <div class="modal-backdrop" id="modalBackdrop"></div>
+  <div class="modal-card">
+    <button class="modal-close" id="modalClose">
+      <iconify-icon icon="mdi:close"></iconify-icon>
+    </button>
+    <div class="modal-body" id="modalBody"></div>
+    <div class="modal-actions">
+      <div class="modal-file-info" id="modalFileInfo"></div>
+      <button class="btn btn-go" id="modalSave">
+        <iconify-icon icon="mdi:content-save"></iconify-icon>
+        <span>Salvar no dispositivo</span>
+      </button>
+    </div>
+  </div>
+</div>
+
 <footer>
-  <p>🌊 Transferência P2P via WebRTC — arquivos não passam por nenhum servidor</p>
+  <p>🌊 P2P via WebRTC · arquivos não passam por nenhum servidor</p>
 </footer>
 
 <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js"></script>
+<script src="https://code.iconify.design/iconify-icon/2.1.0/iconify-icon.min.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

@@ -28,36 +28,57 @@ function fileExt(name) {
   return i >= 0 ? name.slice(i).toLowerCase() : '';
 }
 
-function fileIcon(name) {
+function fileIconName(name) {
   const ext = fileExt(name);
-  if (EXTENSIONS_VIDEO.includes(ext)) return '🎬';
-  if (EXTENSIONS_IMG.includes(ext)) return '🖼️';
-  if (EXTENSIONS_AUDIO.includes(ext)) return '🎵';
-  if (ext === '.pdf') return '📄';
-  if (['.zip','.rar','.7z','.tar','.gz'].includes(ext)) return '🗜️';
-  if (['.doc','.docx','.odt','.txt','.rtf'].includes(ext)) return '📝';
-  if (['.xls','.xlsx','.ods','.csv'].includes(ext)) return '📊';
-  if (['.ppt','.pptx','.odp','.key'].includes(ext)) return '📽️';
-  return '📎';
+  if (EXTENSIONS_VIDEO.includes(ext)) return 'mdi:video';
+  if (EXTENSIONS_IMG.includes(ext)) return 'mdi:image';
+  if (EXTENSIONS_AUDIO.includes(ext)) return 'mdi:music-note';
+  if (ext === '.pdf') return 'mdi:file-pdf-box';
+  if (['.zip','.rar','.7z','.tar','.gz'].includes(ext)) return 'mdi:folder-zip';
+  if (['.doc','.docx','.odt','.txt','.rtf'].includes(ext)) return 'mdi:file-document';
+  if (['.xls','.xlsx','.ods','.csv'].includes(ext)) return 'mdi:file-excel';
+  if (['.ppt','.pptx','.odp','.key'].includes(ext)) return 'mdi:file-powerpoint';
+  return 'mdi:file-outline';
 }
 
+function isImage(name) { return EXTENSIONS_IMG.includes(fileExt(name)); }
+function isVideo(name) { return EXTENSIONS_VIDEO.includes(fileExt(name)); }
+function isAudio(name) { return EXTENSIONS_AUDIO.includes(fileExt(name)); }
 function isPreviewable(name) {
   const ext = fileExt(name);
   return PREVIEWABLE_IMG.includes(ext) || PREVIEWABLE_VIDEO.includes(ext);
 }
 
-// Generate random 4-digit code
+function mimeFor(name) {
+  const ext = fileExt(name);
+  const map = {
+    '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
+    '.gif': 'image/gif', '.webp': 'image/webp', '.avif': 'image/avif',
+    '.bmp': 'image/bmp', '.svg': 'image/svg+xml',
+    '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.webm': 'video/webm',
+    '.m4v': 'video/mp4', '.mkv': 'video/x-matroska',
+    '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.ogg': 'audio/ogg',
+    '.flac': 'audio/flac', '.m4a': 'audio/mp4', '.aac': 'audio/aac',
+    '.pdf': 'application/pdf',
+  };
+  return map[ext] || 'application/octet-stream';
+}
+
 function randomCode() {
   return String(Math.floor(1000 + Math.random() * 9000));
 }
 
-// Detect if peer connection is using LAN, same network (same public IP), or internet
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+// Detect if peer connection is LAN, same-nat, or internet
 async function detectConnectionType(peerConn) {
   try {
     const stats = await peerConn.getStats();
     const all = [];
     stats.forEach(s => all.push(s));
-    const candAddr = (c) => c?.address || c?.ip || null;
+    const addr = (c) => c?.address || c?.ip || null;
 
     const pair = all.find(s => s.type === 'candidate-pair' && s.state === 'succeeded' && (s.nominated || s.selected));
     const local = pair ? all.find(s => s.id === pair.localCandidateId) : null;
@@ -67,26 +88,21 @@ async function detectConnectionType(peerConn) {
 
     const ourPublics = all
       .filter(s => (s.type === 'local-candidate' || s.type === 'candidate') && (s.candidateType === 'srflx' || s.candidateType === 'prflx'))
-      .map(candAddr).filter(Boolean);
+      .map(addr).filter(Boolean);
     const theirAddrs = all
       .filter(s => s.type === 'remote-candidate')
-      .map(candAddr).filter(Boolean);
+      .map(addr).filter(Boolean);
 
     if (ourPublics.some(ip => theirAddrs.includes(ip))) return 'same-nat';
     return 'internet';
-  } catch (e) {
-    return 'unknown';
-  }
+  } catch (e) { return 'unknown'; }
 }
 
 // ================= HOST MODE =================
 
 let hostState = {
-  peer: null,
-  code: null,
-  folderHandle: null,
-  files: new Map(), // path -> {name, size, handle}
-  connections: new Set(),
+  peer: null, code: null, folderHandle: null,
+  files: new Map(), connections: new Set(),
 };
 
 async function startHost() {
@@ -94,24 +110,17 @@ async function startHost() {
     alert('Este navegador não suporta seleção de pasta. Use Chrome ou Edge.');
     return;
   }
-
   let dirHandle;
-  try {
-    dirHandle = await window.showDirectoryPicker({ mode: 'read' });
-  } catch (e) {
-    return; // user cancelled
-  }
+  try { dirHandle = await window.showDirectoryPicker({ mode: 'read' }); }
+  catch (e) { return; }
 
   hostState.folderHandle = dirHandle;
-  $('hostFolderName').textContent = '📁 ' + dirHandle.name;
-
-  const files = await scanDirectory(dirHandle);
-  hostState.files = files;
+  $('hostFolderName').textContent = dirHandle.name;
+  hostState.files = await scanDirectory(dirHandle);
 
   showView('host');
   $('hostStatus').textContent = 'Iniciando...';
   $('hostStatus').className = 'status';
-
   await initHostPeer();
 }
 
@@ -134,7 +143,6 @@ async function scanDirectory(dirHandle, prefix = '') {
 }
 
 async function initHostPeer() {
-  // Try to claim a short code. If taken, try another.
   for (let attempt = 0; attempt < 10; attempt++) {
     const candidate = randomCode();
     const peerId = `ocean-${candidate}`;
@@ -147,7 +155,7 @@ async function initHostPeer() {
       const urlStr = url.toString();
       $('hostLink').textContent = urlStr;
       renderQR(urlStr);
-      $('hostStatus').textContent = 'Aguardando conexões... (código pronto)';
+      $('hostStatus').textContent = 'Pronto. Aguardando conexões...';
       $('hostStatus').className = 'status ok';
       return;
     }
@@ -160,14 +168,14 @@ function tryClaimId(peerId) {
   return new Promise((resolve) => {
     const peer = new Peer(peerId, { debug: 1 });
     let done = false;
-    peer.on('open', (id) => {
+    peer.on('open', () => {
       if (done) return;
       done = true;
       hostState.peer = peer;
       setupHostPeer(peer);
       resolve(true);
     });
-    peer.on('error', (err) => {
+    peer.on('error', () => {
       if (done) return;
       done = true;
       peer.destroy();
@@ -178,7 +186,6 @@ function tryClaimId(peerId) {
 
 function setupHostPeer(peer) {
   peer.on('connection', (conn) => {
-    console.log('incoming connection', conn.peer);
     hostState.connections.add(conn);
     conn.on('open', () => {
       renderPeers();
@@ -199,11 +206,8 @@ function setupHostPeer(peer) {
 function renderPeers() {
   const container = $('hostPeers');
   const n = hostState.connections.size;
-  if (n === 0) {
-    container.innerHTML = '';
-    return;
-  }
-  container.innerHTML = `<div class="peer-item"><span>${n} dispositivo${n>1?'s':''} conectado${n>1?'s':''}</span><span>🟢</span></div>`;
+  container.innerHTML = n === 0 ? '' :
+    `<div class="peer-item"><span>🟢 ${n} dispositivo${n>1?'s':''} conectado${n>1?'s':''}</span></div>`;
 }
 
 async function handleHostMessage(conn, msg) {
@@ -219,6 +223,35 @@ async function handleHostMessage(conn, msg) {
   }
 }
 
+async function sendFileToGuest(conn, path) {
+  const entry = hostState.files.get(path);
+  if (!entry) {
+    conn.send({ type: 'error', path, message: 'Arquivo não encontrado' });
+    return;
+  }
+  try {
+    const file = await entry.handle.getFile();
+    conn.send({ type: 'start', path, name: file.name, size: file.size });
+    const reader = file.stream().getReader();
+    const dc = conn.dataChannel;
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      for (let i = 0; i < value.length; i += CHUNK_SIZE) {
+        const chunk = value.subarray(i, Math.min(i + CHUNK_SIZE, value.length));
+        while (dc && dc.bufferedAmount > BUFFER_THRESHOLD) {
+          await new Promise(r => setTimeout(r, 20));
+        }
+        conn.send(chunk);
+      }
+    }
+    conn.send({ type: 'end', path });
+  } catch (e) {
+    console.error('send error', e);
+    conn.send({ type: 'error', path, message: e.message });
+  }
+}
+
 async function sendPreviewToGuest(conn, path) {
   const entry = hostState.files.get(path);
   if (!entry || !isPreviewable(entry.name)) {
@@ -229,11 +262,8 @@ async function sendPreviewToGuest(conn, path) {
     const file = await entry.handle.getFile();
     const ext = fileExt(entry.name);
     let dataUrl = null;
-    if (PREVIEWABLE_VIDEO.includes(ext)) {
-      dataUrl = await videoFrameThumbnail(file);
-    } else {
-      dataUrl = await imageThumbnail(file);
-    }
+    if (PREVIEWABLE_VIDEO.includes(ext)) dataUrl = await videoFrameThumbnail(file);
+    else dataUrl = await imageThumbnail(file);
     conn.send({ type: 'preview_data', path, dataUrl });
   } catch (e) {
     console.warn('preview failed for', path, e);
@@ -242,14 +272,12 @@ async function sendPreviewToGuest(conn, path) {
 }
 
 async function imageThumbnail(file) {
-  // try createImageBitmap first
   try {
     const bitmap = await createImageBitmap(file);
     const url = drawToDataUrl(bitmap, bitmap.width, bitmap.height);
     bitmap.close?.();
     return url;
   } catch (e1) {
-    // fallback: <img> + blob URL (handles WebP/AVIF/HEIC if browser supports as <img>)
     return new Promise((resolve, reject) => {
       const blobUrl = URL.createObjectURL(file);
       const img = new Image();
@@ -259,15 +287,9 @@ async function imageThumbnail(file) {
           const url = drawToDataUrl(img, img.naturalWidth, img.naturalHeight);
           URL.revokeObjectURL(blobUrl);
           resolve(url);
-        } catch (e) {
-          URL.revokeObjectURL(blobUrl);
-          reject(e);
-        }
+        } catch (e) { URL.revokeObjectURL(blobUrl); reject(e); }
       };
-      img.onerror = () => {
-        URL.revokeObjectURL(blobUrl);
-        reject(new Error('img decode failed'));
-      };
+      img.onerror = () => { URL.revokeObjectURL(blobUrl); reject(new Error('img decode failed')); };
       img.src = blobUrl;
     });
   }
@@ -277,10 +299,7 @@ async function videoFrameThumbnail(file) {
   return new Promise((resolve, reject) => {
     const blobUrl = URL.createObjectURL(file);
     const video = document.createElement('video');
-    video.preload = 'metadata';
-    video.muted = true;
-    video.playsInline = true;
-    video.crossOrigin = 'anonymous';
+    video.preload = 'metadata'; video.muted = true; video.playsInline = true;
     let settled = false;
     const done = (fn, arg) => {
       if (settled) return;
@@ -289,15 +308,12 @@ async function videoFrameThumbnail(file) {
       fn(arg);
     };
     video.addEventListener('loadeddata', () => {
-      try {
-        video.currentTime = Math.min(0.5, video.duration > 0 ? video.duration / 4 : 0);
-      } catch (e) { done(reject, e); }
+      try { video.currentTime = Math.min(0.5, video.duration > 0 ? video.duration / 4 : 0); }
+      catch (e) { done(reject, e); }
     });
     video.addEventListener('seeked', () => {
-      try {
-        const url = drawToDataUrl(video, video.videoWidth, video.videoHeight);
-        done(resolve, url);
-      } catch (e) { done(reject, e); }
+      try { done(resolve, drawToDataUrl(video, video.videoWidth, video.videoHeight)); }
+      catch (e) { done(reject, e); }
     });
     video.addEventListener('error', () => done(reject, new Error('video decode failed')));
     setTimeout(() => done(reject, new Error('video timeout')), 8000);
@@ -319,7 +335,6 @@ function renderQR(url) {
   const canvas = $('hostQr');
   if (!canvas) return;
   if (typeof qrcode === 'undefined') {
-    console.warn('QR lib not loaded, falling back to external image');
     const img = document.createElement('img');
     img.src = `https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(url)}`;
     img.alt = 'QR code';
@@ -342,45 +357,13 @@ function renderQR(url) {
     const ctx = canvas.getContext('2d');
     ctx.fillStyle = '#ffffff';
     ctx.fillRect(0, 0, size, size);
-    ctx.fillStyle = '#005a8f';
+    ctx.fillStyle = '#0f172a';
     for (let r = 0; r < modules; r++) {
       for (let c = 0; c < modules; c++) {
         if (qr.isDark(r, c)) ctx.fillRect(c * scale, r * scale, scale, scale);
       }
     }
-  } catch (e) {
-    console.error('QR render error:', e);
-  }
-}
-
-async function sendFileToGuest(conn, path) {
-  const entry = hostState.files.get(path);
-  if (!entry) {
-    conn.send({ type: 'error', path, message: 'Arquivo não encontrado' });
-    return;
-  }
-  try {
-    const file = await entry.handle.getFile();
-    conn.send({ type: 'start', path, name: file.name, size: file.size });
-    const reader = file.stream().getReader();
-    const dc = conn.dataChannel;
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      // value is Uint8Array — split into 16KB chunks
-      for (let i = 0; i < value.length; i += CHUNK_SIZE) {
-        const chunk = value.subarray(i, Math.min(i + CHUNK_SIZE, value.length));
-        while (dc && dc.bufferedAmount > BUFFER_THRESHOLD) {
-          await new Promise(r => setTimeout(r, 20));
-        }
-        conn.send(chunk);
-      }
-    }
-    conn.send({ type: 'end', path });
-  } catch (e) {
-    console.error('send error', e);
-    conn.send({ type: 'error', path, message: e.message });
-  }
+  } catch (e) { console.error('QR error:', e); }
 }
 
 function stopHost() {
@@ -394,24 +377,36 @@ function stopHost() {
 
 // ================= GUEST MODE =================
 
-let guestState = {
-  peer: null,
-  conn: null,
-  hostCode: null,
+const guestState = {
+  peer: null, conn: null, hostCode: null, folder: '',
   files: [],
-  activeTransfer: null, // { path, name, size, chunks: [], received: 0 }
   previews: new Map(),
   previewsRequested: new Set(),
   previewsPending: 0,
+  downloaded: new Set(),
+  selected: new Set(),
+  queue: [], // [{path, mode: 'save'|'preview'}]
+  activeTransfer: null, // {path, mode, name, size, chunks, received}
 };
+
+function resetGuest() {
+  guestState.peer = null; guestState.conn = null;
+  guestState.hostCode = null; guestState.folder = '';
+  guestState.files = [];
+  guestState.previews = new Map();
+  guestState.previewsRequested = new Set();
+  guestState.previewsPending = 0;
+  guestState.downloaded = new Set();
+  guestState.selected = new Set();
+  guestState.queue = [];
+  guestState.activeTransfer = null;
+}
 
 function showJoin(prefillCode) {
   showView('join');
   $('joinStatus').textContent = '';
   $('joinStatus').className = 'status';
-  if (prefillCode) {
-    $('joinCode').value = prefillCode;
-  }
+  if (prefillCode) $('joinCode').value = prefillCode;
   $('joinCode').focus();
 }
 
@@ -436,22 +431,20 @@ async function connectAsGuest() {
       $('joinStatus').textContent = 'Conectado! Carregando lista...';
       $('joinStatus').className = 'status ok';
       conn.send({ type: 'list' });
-
-      // detect connection type after a moment
       setTimeout(async () => {
         const type = await detectConnectionType(conn.peerConnection);
         const info = $('connInfo');
         if (type === 'lan') {
-          info.textContent = '✓ Conectado pela rede local — transferência direta via LAN';
+          info.innerHTML = '<iconify-icon icon="mdi:wifi-check"></iconify-icon> <span>Conectado pela rede local — transferência direta</span>';
           info.className = 'conn-info lan';
         } else if (type === 'same-nat') {
-          info.textContent = '✓ Mesma rede detectada — tráfego fica no roteador, não vai pra internet';
+          info.innerHTML = '<iconify-icon icon="mdi:wifi-check"></iconify-icon> <span>Mesma rede detectada — tráfego não vai pra internet</span>';
           info.className = 'conn-info same-nat';
         } else if (type === 'internet') {
-          info.textContent = '🌐 Conectado via internet — P2P direto, sem servidor no meio';
+          info.innerHTML = '<iconify-icon icon="mdi:earth"></iconify-icon> <span>Conectado via internet — P2P direto</span>';
           info.className = 'conn-info internet';
         } else {
-          info.textContent = '🔗 Conectado';
+          info.innerHTML = '<iconify-icon icon="mdi:link-variant"></iconify-icon> <span>Conectado</span>';
           info.className = 'conn-info';
         }
       }, 1500);
@@ -484,134 +477,293 @@ async function connectAsGuest() {
 function handleGuestMessage(msg) {
   if (msg.type === 'files') {
     guestState.files = msg.files;
-    guestState.previews = new Map();
-    $('filesTitle').textContent = `Arquivos em 📁 ${msg.folder}`;
+    guestState.folder = msg.folder;
+    $('filesTitle').textContent = `Arquivos em “${msg.folder}”`;
     renderFiles();
     showView('files');
     requestPreviews();
   } else if (msg.type === 'preview_data') {
-    if (msg.dataUrl) guestState.previews.set(msg.path, msg.dataUrl);
-    else guestState.previews.set(msg.path, null);
+    guestState.previews.set(msg.path, msg.dataUrl || null);
     updateFileThumbnail(msg.path);
     guestState.previewsPending--;
     requestPreviews();
   } else if (msg.type === 'start') {
-    guestState.activeTransfer = {
-      path: msg.path, name: msg.name, size: msg.size,
-      chunks: [], received: 0
-    };
+    const t = guestState.activeTransfer;
+    if (!t || t.path !== msg.path) return;
+    t.name = msg.name; t.size = msg.size;
     renderTransfers();
+    updateModalProgress();
   } else if (msg instanceof ArrayBuffer || msg instanceof Uint8Array) {
-    if (!guestState.activeTransfer) return;
+    const t = guestState.activeTransfer;
+    if (!t) return;
     const buf = msg instanceof Uint8Array ? msg : new Uint8Array(msg);
-    guestState.activeTransfer.chunks.push(buf);
-    guestState.activeTransfer.received += buf.length;
+    t.chunks.push(buf);
+    t.received += buf.length;
     renderTransfers();
+    updateModalProgress();
   } else if (msg.type === 'end') {
     const t = guestState.activeTransfer;
     if (!t || t.path !== msg.path) return;
-    const blob = new Blob(t.chunks);
-    downloadBlob(blob, t.name);
-    guestState.activeTransfer = null;
-    renderTransfers();
+    const blob = new Blob(t.chunks, { type: mimeFor(t.name) });
+    finishTransfer(t, blob);
   } else if (msg.type === 'error') {
-    alert('Erro ao baixar: ' + msg.message);
+    alert('Erro: ' + msg.message);
     guestState.activeTransfer = null;
     renderTransfers();
+    processQueue();
   }
+}
+
+function finishTransfer(t, blob) {
+  if (t.mode === 'save') {
+    downloadBlob(blob, t.name);
+    guestState.downloaded.add(t.path);
+    renderFiles();
+  } else if (t.mode === 'preview') {
+    showPreviewBlob(t, blob);
+  }
+  guestState.activeTransfer = null;
+  renderTransfers();
+  processQueue();
 }
 
 function downloadBlob(blob, name) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
-  a.href = url;
-  a.download = name;
-  document.body.appendChild(a);
-  a.click();
+  a.href = url; a.download = name;
+  document.body.appendChild(a); a.click();
   document.body.removeChild(a);
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
+
+function enqueue(path, mode) {
+  // avoid double queuing same path in same mode
+  if (guestState.queue.some(q => q.path === path && q.mode === mode)) return;
+  if (guestState.activeTransfer?.path === path && guestState.activeTransfer.mode === mode) return;
+  guestState.queue.push({ path, mode });
+  processQueue();
+}
+
+function processQueue() {
+  if (guestState.activeTransfer) return;
+  const next = guestState.queue.shift();
+  if (!next) return;
+  const fileMeta = guestState.files.find(f => f.path === next.path);
+  if (!fileMeta) { processQueue(); return; }
+  guestState.activeTransfer = {
+    path: next.path, mode: next.mode,
+    name: fileMeta.name, size: fileMeta.size,
+    chunks: [], received: 0
+  };
+  guestState.conn.send({ type: 'get', path: next.path });
+  renderTransfers();
+  if (next.mode === 'preview') renderModalLoading(fileMeta);
+}
+
+// Files rendering
 
 function renderFiles() {
   const list = $('fileList');
   if (guestState.files.length === 0) {
     list.innerHTML = '<div class="file-empty">Nenhum arquivo disponível</div>';
+    updateSelectBar();
     return;
   }
-  list.innerHTML = guestState.files.map((f, idx) => `
-    <div class="file-item" data-idx="${idx}" data-path="${escapeHtml(f.path)}">
-      <span class="file-slot">${fileIcon(f.name)}</span>
-      <div class="file-meta">
-        <div class="file-name">${escapeHtml(f.name)}</div>
-        <div class="file-size">${fmtSize(f.size)}</div>
+  list.innerHTML = guestState.files.map((f, idx) => {
+    const isSel = guestState.selected.has(f.path);
+    const isDl = guestState.downloaded.has(f.path);
+    const previewable = isPreviewable(f.name) || isAudio(f.name);
+    return `
+      <div class="file-item ${isSel ? 'selected' : ''} ${isDl ? 'downloaded' : ''}" data-path="${escapeHtml(f.path)}" data-idx="${idx}">
+        <div class="file-chk" data-act="select">
+          <iconify-icon icon="mdi:check"></iconify-icon>
+        </div>
+        <div class="file-slot" data-act="${previewable ? 'preview' : 'download'}">
+          ${renderThumb(f)}
+        </div>
+        <div class="file-meta" data-act="${previewable ? 'preview' : 'download'}">
+          <div class="file-name">${escapeHtml(f.name)}</div>
+          <div class="file-size">${fmtSize(f.size)}</div>
+        </div>
+        <div class="file-actions" data-act="download">
+          ${isDl
+            ? '<iconify-icon icon="mdi:check-circle" class="ico-done"></iconify-icon>'
+            : '<iconify-icon icon="mdi:download"></iconify-icon>'}
+        </div>
       </div>
-      <span>⬇</span>
-    </div>
-  `).join('');
+    `;
+  }).join('');
   list.querySelectorAll('.file-item').forEach(el => {
-    el.addEventListener('click', () => {
-      const idx = parseInt(el.dataset.idx);
-      requestDownload(guestState.files[idx]);
+    el.addEventListener('click', (e) => {
+      const target = e.target.closest('[data-act]');
+      const act = target?.dataset.act;
+      const path = el.dataset.path;
+      const file = guestState.files.find(f => f.path === path);
+      if (!file) return;
+      if (act === 'select') toggleSelect(path);
+      else if (act === 'download') enqueue(path, 'save');
+      else if (act === 'preview') {
+        if (isPreviewable(file.name) || isAudio(file.name)) openPreview(file);
+        else enqueue(path, 'save');
+      }
     });
   });
+  updateSelectBar();
+}
+
+function renderThumb(f) {
+  const dataUrl = guestState.previews.get(f.path);
+  if (dataUrl) return `<img class="file-thumb" src="${dataUrl}" alt="">`;
+  return `<iconify-icon icon="${fileIconName(f.name)}"></iconify-icon>`;
 }
 
 function updateFileThumbnail(path) {
-  const dataUrl = guestState.previews.get(path);
-  if (!dataUrl) return;
-  const item = $('fileList').querySelector(`.file-item[data-path="${CSS.escape(path)}"] .file-slot`);
-  if (item) {
-    item.innerHTML = `<img class="file-thumb" src="${dataUrl}" alt="">`;
-  }
+  const slot = $('fileList').querySelector(`.file-item[data-path="${CSS.escape(path)}"] .file-slot`);
+  if (!slot) return;
+  const f = guestState.files.find(x => x.path === path);
+  if (!f) return;
+  slot.innerHTML = renderThumb(f);
 }
 
 function requestPreviews() {
   if (!guestState.conn || !guestState.files) return;
   const MAX_PARALLEL = 3;
-  guestState.previewsPending = guestState.previewsPending || 0;
   while (guestState.previewsPending < MAX_PARALLEL) {
-    const next = guestState.files.find(f => isPreviewable(f.name) && !guestState.previews.has(f.path) && !guestState.previewsRequested?.has(f.path));
+    const next = guestState.files.find(f =>
+      isPreviewable(f.name) &&
+      !guestState.previews.has(f.path) &&
+      !guestState.previewsRequested.has(f.path)
+    );
     if (!next) return;
-    guestState.previewsRequested = guestState.previewsRequested || new Set();
     guestState.previewsRequested.add(next.path);
     guestState.previewsPending++;
     guestState.conn.send({ type: 'preview', path: next.path });
   }
 }
 
-function requestDownload(file) {
-  if (guestState.activeTransfer) {
-    alert('Aguarde a transferência atual terminar');
-    return;
-  }
-  guestState.conn.send({ type: 'get', path: file.path });
+// Selection
+
+function toggleSelect(path) {
+  if (guestState.selected.has(path)) guestState.selected.delete(path);
+  else guestState.selected.add(path);
+  renderFiles();
 }
+
+function clearSelection() {
+  guestState.selected.clear();
+  renderFiles();
+}
+
+function downloadSelected() {
+  const paths = Array.from(guestState.selected);
+  paths.forEach(p => enqueue(p, 'save'));
+  clearSelection();
+}
+
+function updateSelectBar() {
+  const bar = $('selectBar');
+  const n = guestState.selected.size;
+  $('selCount').textContent = n;
+  bar.classList.toggle('hidden', n === 0);
+}
+
+// Transfers UI
 
 function renderTransfers() {
   const container = $('transfers');
   const t = guestState.activeTransfer;
-  if (!t) {
-    container.innerHTML = '';
-    return;
+  const qLen = guestState.queue.length;
+  if (!t && qLen === 0) { container.innerHTML = ''; return; }
+  let html = '';
+  if (t) {
+    const pct = t.size ? Math.min(100, (t.received / t.size) * 100) : 0;
+    const label = t.mode === 'preview' ? 'Carregando preview' : 'Baixando';
+    html += `
+      <div class="transfer-item">
+        <div class="transfer-name">${label}: ${escapeHtml(t.name)}</div>
+        <div class="transfer-meta">${fmtSize(t.received)} / ${fmtSize(t.size || 0)} (${pct.toFixed(0)}%)</div>
+        <div class="transfer-bar"><div class="transfer-bar-fill" style="width:${pct}%"></div></div>
+      </div>`;
   }
-  const pct = Math.min(100, (t.received / t.size) * 100);
-  container.innerHTML = `
-    <div class="transfer-item">
-      <div>${escapeHtml(t.name)} — ${fmtSize(t.received)} / ${fmtSize(t.size)} (${pct.toFixed(0)}%)</div>
-      <div class="transfer-bar"><div class="transfer-bar-fill" style="width:${pct}%"></div></div>
-    </div>
+  if (qLen > 0) {
+    html += `<div class="transfer-item"><div class="transfer-meta">${qLen} em fila</div></div>`;
+  }
+  container.innerHTML = html;
+}
+
+// Modal preview
+
+const modalState = { blob: null, name: null, path: null };
+
+function openPreview(file) {
+  modalState.blob = null;
+  modalState.name = file.name;
+  modalState.path = file.path;
+  $('modal').classList.remove('hidden');
+  renderModalLoading(file);
+  enqueue(file.path, 'preview');
+}
+
+function closeModal() {
+  $('modal').classList.add('hidden');
+  $('modalBody').innerHTML = '';
+  modalState.blob = null; modalState.name = null; modalState.path = null;
+}
+
+function renderModalLoading(file) {
+  $('modalFileInfo').innerHTML = `
+    <div class="n">${escapeHtml(file.name)}</div>
+    <div class="s">${fmtSize(file.size)}</div>
   `;
+  $('modalBody').innerHTML = `
+    <div class="modal-loading">
+      <iconify-icon icon="mdi:progress-download" style="font-size:48px;color:var(--accent)"></iconify-icon>
+      <div style="margin-top:12px">Carregando <span id="modalPct">0</span>%</div>
+      <div class="transfer-bar"><div class="transfer-bar-fill" id="modalBarFill" style="width:0%"></div></div>
+    </div>`;
+}
+
+function updateModalProgress() {
+  const t = guestState.activeTransfer;
+  if (!t || t.mode !== 'preview') return;
+  const pct = t.size ? Math.min(100, (t.received / t.size) * 100) : 0;
+  const pctEl = $('modalPct'); const barEl = $('modalBarFill');
+  if (pctEl) pctEl.textContent = pct.toFixed(0);
+  if (barEl) barEl.style.width = pct + '%';
+}
+
+function showPreviewBlob(t, blob) {
+  modalState.blob = blob;
+  const url = URL.createObjectURL(blob);
+  const name = t.name;
+  let html;
+  if (isImage(name)) {
+    html = `<img src="${url}" alt="${escapeHtml(name)}">`;
+  } else if (isVideo(name)) {
+    html = `<video src="${url}" controls autoplay playsinline></video>`;
+  } else if (isAudio(name)) {
+    html = `<div style="padding:20px"><audio src="${url}" controls autoplay></audio></div>`;
+  } else {
+    html = `<div class="modal-generic">
+      <iconify-icon icon="${fileIconName(name)}"></iconify-icon>
+      <p>Preview não disponível para este tipo. Salve no dispositivo para abrir.</p>
+    </div>`;
+  }
+  $('modalBody').innerHTML = html;
+}
+
+function saveFromModal() {
+  if (!modalState.blob || !modalState.name) return;
+  downloadBlob(modalState.blob, modalState.name);
+  guestState.downloaded.add(modalState.path);
+  renderFiles();
 }
 
 function disconnectGuest() {
   if (guestState.conn) guestState.conn.close();
   if (guestState.peer) guestState.peer.destroy();
-  guestState = { peer: null, conn: null, hostCode: null, files: [], activeTransfer: null, previews: new Map(), previewsRequested: new Set(), previewsPending: 0 };
+  resetGuest();
   showView('home');
-}
-
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
 // ================= INIT =================
@@ -622,6 +774,12 @@ $('btnStop').addEventListener('click', stopHost);
 $('btnConnect').addEventListener('click', connectAsGuest);
 $('btnJoinBack').addEventListener('click', () => showView('home'));
 $('btnDisconnect').addEventListener('click', disconnectGuest);
+$('btnSelClear').addEventListener('click', clearSelection);
+$('btnSelDownload').addEventListener('click', downloadSelected);
+
+$('modalClose').addEventListener('click', closeModal);
+$('modalBackdrop').addEventListener('click', closeModal);
+$('modalSave').addEventListener('click', saveFromModal);
 
 $('joinCode').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') connectAsGuest();
@@ -629,15 +787,16 @@ $('joinCode').addEventListener('keydown', (e) => {
 
 $('hostLink').addEventListener('click', () => {
   navigator.clipboard.writeText($('hostLink').textContent);
+  const orig = $('hostLink').textContent;
   $('hostLink').textContent = '✓ Copiado!';
-  setTimeout(() => {
-    const url = new URL(location.href);
-    url.hash = `#${hostState.code}`;
-    $('hostLink').textContent = url.toString();
-  }, 1500);
+  setTimeout(() => { $('hostLink').textContent = orig; }, 1500);
 });
 
-// If URL has #CODE, jump straight to join screen with code filled in
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !$('modal').classList.contains('hidden')) closeModal();
+});
+
+// Deep link: #CODE opens join view
 if (location.hash && /^#\d{4}$/.test(location.hash)) {
   showJoin(location.hash.slice(1));
 }

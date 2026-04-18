@@ -57,21 +57,22 @@ async function detectConnectionType(peerConn) {
     const stats = await peerConn.getStats();
     const all = [];
     stats.forEach(s => all.push(s));
+    const candAddr = (c) => c?.address || c?.ip || null;
+
     const pair = all.find(s => s.type === 'candidate-pair' && s.state === 'succeeded' && (s.nominated || s.selected));
-    if (!pair) return 'unknown';
-    const local = all.find(s => s.id === pair.localCandidateId);
-    const remote = all.find(s => s.id === pair.remoteCandidateId);
-    if (!local || !remote) return 'unknown';
+    const local = pair ? all.find(s => s.id === pair.localCandidateId) : null;
+    const remote = pair ? all.find(s => s.id === pair.remoteCandidateId) : null;
 
-    // Direct LAN: both peers sent local addresses directly
-    if (local.candidateType === 'host' && remote.candidateType === 'host') return 'lan';
+    if (local?.candidateType === 'host' && remote?.candidateType === 'host') return 'lan';
 
-    // If both share same public IP (srflx), they're behind same NAT = same network
-    const localSrflx = all.find(s => (s.type === 'local-candidate' || s.type === 'candidate') && s.candidateType === 'srflx');
-    const remoteSrflx = all.find(s => s.type === 'remote-candidate' && s.candidateType === 'srflx');
-    if (localSrflx && remoteSrflx && localSrflx.address && localSrflx.address === remoteSrflx.address) {
-      return 'same-nat';
-    }
+    const ourPublics = all
+      .filter(s => (s.type === 'local-candidate' || s.type === 'candidate') && (s.candidateType === 'srflx' || s.candidateType === 'prflx'))
+      .map(candAddr).filter(Boolean);
+    const theirAddrs = all
+      .filter(s => s.type === 'remote-candidate')
+      .map(candAddr).filter(Boolean);
+
+    if (ourPublics.some(ip => theirAddrs.includes(ip))) return 'same-nat';
     return 'internet';
   } catch (e) {
     return 'unknown';

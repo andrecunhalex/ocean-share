@@ -7,7 +7,8 @@ const THUMB_SIZE = 120;
 const EXTENSIONS_VIDEO = ['.mp4','.mov','.avi','.mkv','.m4v','.wmv','.webm','.flv','.mpg','.mpeg','.3gp'];
 const EXTENSIONS_IMG = ['.jpg','.jpeg','.png','.gif','.webp','.bmp','.svg','.heic','.heif','.avif','.tiff','.tif'];
 const EXTENSIONS_AUDIO = ['.mp3','.wav','.ogg','.flac','.m4a','.aac','.opus'];
-const PREVIEWABLE_IMG = ['.jpg','.jpeg','.png','.gif','.webp','.bmp','.avif']; // browsers can decode these
+const PREVIEWABLE_IMG = ['.jpg','.jpeg','.png','.gif','.webp','.bmp','.avif'];
+const PREVIEWABLE_VIDEO = ['.mp4','.mov','.webm','.m4v'];
 
 const $ = (id) => document.getElementById(id);
 const views = ['home','host','join','files'];
@@ -41,7 +42,8 @@ function fileIcon(name) {
 }
 
 function isPreviewable(name) {
-  return PREVIEWABLE_IMG.includes(fileExt(name));
+  const ext = fileExt(name);
+  return PREVIEWABLE_IMG.includes(ext) || PREVIEWABLE_VIDEO.includes(ext);
 }
 
 // Generate random 4-digit code
@@ -224,27 +226,130 @@ async function sendPreviewToGuest(conn, path) {
   }
   try {
     const file = await entry.handle.getFile();
-    const bitmap = await createImageBitmap(file);
-    const ratio = Math.min(THUMB_SIZE / bitmap.width, THUMB_SIZE / bitmap.height, 1);
-    const w = Math.max(1, Math.round(bitmap.width * ratio));
-    const h = Math.max(1, Math.round(bitmap.height * ratio));
-    const canvas = document.createElement('canvas');
-    canvas.width = w; canvas.height = h;
-    canvas.getContext('2d').drawImage(bitmap, 0, 0, w, h);
-    bitmap.close?.();
-    const dataUrl = canvas.toDataURL('image/jpeg', 0.7);
+    const ext = fileExt(entry.name);
+    let dataUrl = null;
+    if (PREVIEWABLE_VIDEO.includes(ext)) {
+      dataUrl = await videoFrameThumbnail(file);
+    } else {
+      dataUrl = await imageThumbnail(file);
+    }
     conn.send({ type: 'preview_data', path, dataUrl });
   } catch (e) {
+    console.warn('preview failed for', path, e);
     conn.send({ type: 'preview_data', path, dataUrl: null });
   }
 }
 
+async function imageThumbnail(file) {
+  // try createImageBitmap first
+  try {
+    const bitmap = await createImageBitmap(file);
+    const url = drawToDataUrl(bitmap, bitmap.width, bitmap.height);
+    bitmap.close?.();
+    return url;
+  } catch (e1) {
+    // fallback: <img> + blob URL (handles WebP/AVIF/HEIC if browser supports as <img>)
+    return new Promise((resolve, reject) => {
+      const blobUrl = URL.createObjectURL(file);
+      const img = new Image();
+      img.decoding = 'async';
+      img.onload = () => {
+        try {
+          const url = drawToDataUrl(img, img.naturalWidth, img.naturalHeight);
+          URL.revokeObjectURL(blobUrl);
+          resolve(url);
+        } catch (e) {
+          URL.revokeObjectURL(blobUrl);
+          reject(e);
+        }
+      };
+      img.onerror = () => {
+        URL.revokeObjectURL(blobUrl);
+        reject(new Error('img decode failed'));
+      };
+      img.src = blobUrl;
+    });
+  }
+}
+
+async function videoFrameThumbnail(file) {
+  return new Promise((resolve, reject) => {
+    const blobUrl = URL.createObjectURL(file);
+    const video = document.createElement('video');
+    video.preload = 'metadata';
+    video.muted = true;
+    video.playsInline = true;
+    video.crossOrigin = 'anonymous';
+    let settled = false;
+    const done = (fn, arg) => {
+      if (settled) return;
+      settled = true;
+      URL.revokeObjectURL(blobUrl);
+      fn(arg);
+    };
+    video.addEventListener('loadeddata', () => {
+      try {
+        video.currentTime = Math.min(0.5, video.duration > 0 ? video.duration / 4 : 0);
+      } catch (e) { done(reject, e); }
+    });
+    video.addEventListener('seeked', () => {
+      try {
+        const url = drawToDataUrl(video, video.videoWidth, video.videoHeight);
+        done(resolve, url);
+      } catch (e) { done(reject, e); }
+    });
+    video.addEventListener('error', () => done(reject, new Error('video decode failed')));
+    setTimeout(() => done(reject, new Error('video timeout')), 8000);
+    video.src = blobUrl;
+  });
+}
+
+function drawToDataUrl(source, srcW, srcH) {
+  const ratio = Math.min(THUMB_SIZE / srcW, THUMB_SIZE / srcH, 1);
+  const w = Math.max(1, Math.round(srcW * ratio));
+  const h = Math.max(1, Math.round(srcH * ratio));
+  const canvas = document.createElement('canvas');
+  canvas.width = w; canvas.height = h;
+  canvas.getContext('2d').drawImage(source, 0, 0, w, h);
+  return canvas.toDataURL('image/jpeg', 0.7);
+}
+
 function renderQR(url) {
   const canvas = $('hostQr');
-  if (!canvas || typeof QRCode === 'undefined') return;
-  QRCode.toCanvas(canvas, url, { width: 200, margin: 1, color: { dark: '#005a8f', light: '#ffffff' } }, (err) => {
-    if (err) console.error('qr error', err);
-  });
+  if (!canvas) return;
+  if (typeof qrcode === 'undefined') {
+    console.warn('QR lib not loaded, falling back to external image');
+    const img = document.createElement('img');
+    img.src = `https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(url)}`;
+    img.alt = 'QR code';
+    img.style.maxWidth = '220px';
+    canvas.replaceWith(img);
+    img.id = 'hostQr';
+    return;
+  }
+  try {
+    const qr = qrcode(0, 'M');
+    qr.addData(url);
+    qr.make();
+    const modules = qr.getModuleCount();
+    const scale = 6;
+    const size = modules * scale;
+    canvas.width = size;
+    canvas.height = size;
+    canvas.style.width = Math.min(220, size) + 'px';
+    canvas.style.height = Math.min(220, size) + 'px';
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, size, size);
+    ctx.fillStyle = '#005a8f';
+    for (let r = 0; r < modules; r++) {
+      for (let c = 0; c < modules; c++) {
+        if (qr.isDark(r, c)) ctx.fillRect(c * scale, r * scale, scale, scale);
+      }
+    }
+  } catch (e) {
+    console.error('QR render error:', e);
+  }
 }
 
 async function sendFileToGuest(conn, path) {

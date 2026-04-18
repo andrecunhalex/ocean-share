@@ -484,6 +484,7 @@ input[type="text"]:focus {
 .select-bar {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
   background: rgba(56, 189, 248, 0.06);
   border: 1px solid rgba(56, 189, 248, 0.15);
@@ -491,7 +492,7 @@ input[type="text"]:focus {
   padding: 10px 12px;
   margin-bottom: 12px;
 }
-.sel-count { flex: 1; font-size: 0.85rem; font-weight: 600; }
+.sel-count { flex: 1 1 100%; font-size: 0.85rem; font-weight: 600; min-width: 0; }
 .sel-count span { color: var(--accent); }
 .sel-btn {
   background: rgba(255, 255, 255, 0.05);
@@ -512,6 +513,7 @@ input[type="text"]:focus {
   background: linear-gradient(135deg, #0ea5e9, #0284c7);
   border: none;
   color: #fff;
+  margin-left: auto;
 }
 .sel-btn iconify-icon { font-size: 16px; }
 

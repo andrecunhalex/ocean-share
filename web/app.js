@@ -760,12 +760,8 @@ function clearSelection() {
 }
 
 function selectAll() {
-  const prefix = guestState.currentPath ? guestState.currentPath + '/' : '';
-  guestState.files.forEach(f => {
-    if (!prefix || f.path.startsWith(prefix)) {
-      guestState.selected.add(f.path);
-    }
-  });
+  const { files } = getViewItems();
+  files.forEach(f => guestState.selected.add(f.path));
   renderFiles();
 }
 

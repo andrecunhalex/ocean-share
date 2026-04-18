@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OceanShare 🌊</title>
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="ocean-icon.jpg">
+</head>
+<body>
+<header>
+  <h1>OceanShare 🌊</h1>
+  <p class="tagline">Compartilhamento direto entre dispositivos</p>
+</header>
+
+<main>
+  <!-- Tela inicial: escolher modo -->
+  <section id="home" class="view">
+    <div class="card">
+      <h2>O que você quer fazer?</h2>
+      <button id="btnHost" class="primary big">📂 Compartilhar uma pasta</button>
+      <button id="btnJoin" class="secondary big">⬇ Receber arquivos</button>
+    </div>
+    <p class="hint">Use Chrome ou Edge no computador que vai <b>compartilhar</b> a pasta.</p>
+  </section>
+
+  <!-- Host: compartilhando -->
+  <section id="host" class="view hidden">
+    <div class="card">
+      <h2>Sua pasta está online</h2>
+      <p class="folder-name" id="hostFolderName">—</p>
+      <div class="code-box">
+        <div class="code-label">Código para conectar:</div>
+        <div class="code" id="hostCode">----</div>
+      </div>
+      <p class="share-url">Ou abra este link no outro dispositivo:</p>
+      <div class="link-box" id="hostLink">—</div>
+      <div id="hostStatus" class="status">Aguardando...</div>
+      <div id="hostPeers" class="peers"></div>
+      <button id="btnStop" class="danger">Parar de compartilhar</button>
+    </div>
+  </section>
+
+  <!-- Guest: conectando -->
+  <section id="join" class="view hidden">
+    <div class="card">
+      <h2>Digite o código</h2>
+      <input type="text" id="joinCode" maxlength="6" placeholder="1234" autocomplete="off" inputmode="numeric">
+      <button id="btnConnect" class="primary big">Conectar</button>
+      <button id="btnJoinBack" class="link">← Voltar</button>
+      <div id="joinStatus" class="status"></div>
+    </div>
+  </section>
+
+  <!-- Guest conectado: lista de arquivos -->
+  <section id="files" class="view hidden">
+    <div class="card">
+      <div class="conn-info" id="connInfo"></div>
+      <h2 id="filesTitle">Arquivos disponíveis</h2>
+      <div class="file-list" id="fileList"></div>
+      <div id="transfers" class="transfers"></div>
+      <button id="btnDisconnect" class="danger">Desconectar</button>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <p>🌊 Transferência P2P via WebRTC — arquivos não passam por nenhum servidor</p>
+</footer>
+
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

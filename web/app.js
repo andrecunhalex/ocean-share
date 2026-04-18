@@ -759,6 +759,16 @@ function clearSelection() {
   renderFiles();
 }
 
+function selectAll() {
+  const prefix = guestState.currentPath ? guestState.currentPath + '/' : '';
+  guestState.files.forEach(f => {
+    if (!prefix || f.path.startsWith(prefix)) {
+      guestState.selected.add(f.path);
+    }
+  });
+  renderFiles();
+}
+
 function downloadSelected() {
   const paths = Array.from(guestState.selected);
   paths.forEach(p => enqueue(p, 'save'));
@@ -880,6 +890,7 @@ $('btnConnect').addEventListener('click', connectAsGuest);
 $('btnJoinBack').addEventListener('click', () => showView('home'));
 $('btnDisconnect').addEventListener('click', disconnectGuest);
 $('btnSelClear').addEventListener('click', clearSelection);
+$('btnSelAll').addEventListener('click', selectAll);
 $('btnSelDownload').addEventListener('click', downloadSelected);
 
 $('modalClose').addEventListener('click', closeModal);

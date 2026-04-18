@@ -1,8 +1,9 @@
 // OceanShare Web — P2P file sharing via WebRTC
 // Host shares a folder, guests connect with a code and download files
 
-const CHUNK_SIZE = 16 * 1024;
-const BUFFER_THRESHOLD = 1024 * 1024; // 1MB
+const CHUNK_SIZE = 64 * 1024;       // 64KB — modern WebRTC handles this cleanly
+const BUFFER_HIGH = 8 * 1024 * 1024; // 8MB: pause when buffer exceeds
+const BUFFER_LOW = 2 * 1024 * 1024;  // 2MB: resume when buffer drops below
 const THUMB_SIZE = 120;
 const EXTENSIONS_VIDEO = ['.mp4','.mov','.avi','.mkv','.m4v','.wmv','.webm','.flv','.mpg','.mpeg','.3gp'];
 const EXTENSIONS_IMG = ['.jpg','.jpeg','.png','.gif','.webp','.bmp','.svg','.heic','.heif','.avif','.tiff','.tif'];
@@ -232,16 +233,17 @@ async function sendFileToGuest(conn, path) {
   try {
     const file = await entry.handle.getFile();
     conn.send({ type: 'start', path, name: file.name, size: file.size });
-    const reader = file.stream().getReader();
+
     const dc = conn.dataChannel;
+    if (dc) dc.bufferedAmountLowThreshold = BUFFER_LOW;
+
+    const reader = file.stream().getReader();
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
       for (let i = 0; i < value.length; i += CHUNK_SIZE) {
         const chunk = value.subarray(i, Math.min(i + CHUNK_SIZE, value.length));
-        while (dc && dc.bufferedAmount > BUFFER_THRESHOLD) {
-          await new Promise(r => setTimeout(r, 20));
-        }
+        if (dc && dc.bufferedAmount > BUFFER_HIGH) await waitForDrain(dc);
         conn.send(chunk);
       }
     }
@@ -250,6 +252,13 @@ async function sendFileToGuest(conn, path) {
     console.error('send error', e);
     conn.send({ type: 'error', path, message: e.message });
   }
+}
+
+function waitForDrain(dc) {
+  return new Promise((resolve) => {
+    const handler = () => { dc.removeEventListener('bufferedamountlow', handler); resolve(); };
+    dc.addEventListener('bufferedamountlow', handler);
+  });
 }
 
 async function sendPreviewToGuest(conn, path) {
@@ -299,24 +308,40 @@ async function videoFrameThumbnail(file) {
   return new Promise((resolve, reject) => {
     const blobUrl = URL.createObjectURL(file);
     const video = document.createElement('video');
-    video.preload = 'metadata'; video.muted = true; video.playsInline = true;
+    video.preload = 'auto';
+    video.muted = true;
+    video.playsInline = true;
+    video.crossOrigin = 'anonymous';
     let settled = false;
     const done = (fn, arg) => {
       if (settled) return;
       settled = true;
       URL.revokeObjectURL(blobUrl);
+      video.removeAttribute('src');
+      video.load();
       fn(arg);
     };
-    video.addEventListener('loadeddata', () => {
-      try { video.currentTime = Math.min(0.5, video.duration > 0 ? video.duration / 4 : 0); }
-      catch (e) { done(reject, e); }
+    video.addEventListener('loadedmetadata', () => {
+      try {
+        const seekTo = video.duration && video.duration > 0
+          ? Math.min(1, video.duration / 4)
+          : 0;
+        video.currentTime = seekTo;
+      } catch (e) { done(reject, e); }
     });
     video.addEventListener('seeked', () => {
-      try { done(resolve, drawToDataUrl(video, video.videoWidth, video.videoHeight)); }
-      catch (e) { done(reject, e); }
+      try {
+        if (!video.videoWidth || !video.videoHeight) {
+          return done(reject, new Error('no video dimensions'));
+        }
+        done(resolve, drawToDataUrl(video, video.videoWidth, video.videoHeight));
+      } catch (e) { done(reject, e); }
     });
-    video.addEventListener('error', () => done(reject, new Error('video decode failed')));
-    setTimeout(() => done(reject, new Error('video timeout')), 8000);
+    video.addEventListener('error', (e) => {
+      console.warn('video thumbnail error', file.name, video.error);
+      done(reject, new Error('video decode failed'));
+    });
+    setTimeout(() => done(reject, new Error('video timeout')), 20000);
     video.src = blobUrl;
   });
 }

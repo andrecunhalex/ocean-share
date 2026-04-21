@@ -16,6 +16,7 @@ import subprocess
 import threading
 import signal
 import time
+import zipfile
 import webview
 
 PREFERRED_PORT = 8080
@@ -212,19 +213,119 @@ def scan_all_files(folder):
     except: pass
     return files
 
-def generate_thumbnail(fp, thumb_path):
+_THUMB_LOCK = threading.Lock()
+_THUMB_INFLIGHT = {}
+# Global cap on concurrent qlmanage/sips spawns. Without this, 15 phones
+# loading a 1000-photo grid can fire 200+ subprocesses at once and the Mac
+# thrashes. 6 is a sweet spot on M-series: saturates cores without queueing.
+_THUMB_SEM = threading.Semaphore(6)
+# Lightbox previews get a separate lane so tapping a photo is never queued
+# behind scroll-triggered thumb generation. With 2k RAWs + 15 phones, sharing
+# one semaphore meant preview taps waited minutes for the thumb backlog.
+_PREVIEW_SEM = threading.Semaphore(3)
+
+def _sips_convert(fp, out_path, size, fmt="png", quality=None):
+    """Convert fp -> out_path using macOS sips (ImageIO RAW codec).
+
+    Handles .arw/.nef/.cr2/.cr3/.raf/.rw2/.orf/.dng/.heic/.tiff far more
+    reliably than qlmanage, which sometimes returns silently without a PNG.
+    """
     try:
-        os.makedirs(os.path.dirname(thumb_path), exist_ok=True)
+        cmd = ["sips", "-Z", str(size), "-s", "format", fmt]
+        if quality is not None and fmt in ("jpeg", "jpg"):
+            cmd += ["-s", "formatOptions", str(quality)]
+        cmd += ["--out", out_path, fp]
+        subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        return os.path.exists(out_path) and os.path.getsize(out_path) > 0
+    except Exception:
+        return False
+
+def _qlmanage_thumb(fp, thumb_path):
+    try:
         subprocess.run(["qlmanage", "-t", "-s", "300", "-o", os.path.dirname(thumb_path), fp],
-                       capture_output=True, text=True, timeout=10)
-        base_gen = os.path.join(os.path.dirname(thumb_path), os.path.basename(fp) + ".png")
-        if os.path.exists(base_gen):
-            os.rename(base_gen, thumb_path); return True
+                       capture_output=True, text=True, timeout=45)
+    except Exception:
+        return False
+    base_gen = os.path.join(os.path.dirname(thumb_path), os.path.basename(fp) + ".png")
+    if os.path.exists(base_gen):
+        try: os.rename(base_gen, thumb_path); return True
+        except: pass
+    try:
         for c in os.listdir(os.path.dirname(thumb_path)):
             if c.endswith(".png") and c.startswith(os.path.splitext(os.path.basename(fp))[0]):
                 src = os.path.join(os.path.dirname(thumb_path), c)
-                if src != thumb_path: os.rename(src, thumb_path); return True
-    except: pass
+                if src != thumb_path:
+                    try: os.rename(src, thumb_path); return True
+                    except: pass
+    except Exception:
+        pass
+    return False
+
+def generate_thumbnail(fp, thumb_path):
+    # Dedup concurrent requests for the same thumb (e.g. 15 phones asking at once).
+    with _THUMB_LOCK:
+        ev = _THUMB_INFLIGHT.get(thumb_path)
+        if ev is not None:
+            owner = False
+        else:
+            ev = threading.Event()
+            _THUMB_INFLIGHT[thumb_path] = ev
+            owner = True
+    if not owner:
+        ev.wait(timeout=60)
+        return os.path.exists(thumb_path)
+    try:
+        os.makedirs(os.path.dirname(thumb_path), exist_ok=True)
+        ext = os.path.splitext(fp)[1].lower()
+        with _THUMB_SEM:
+            # For camera RAW / HEIC / TIFF, sips is more reliable than qlmanage.
+            if ext in ('.arw','.nef','.cr2','.cr3','.raf','.rw2','.orf','.dng','.raw','.heic','.heif','.tiff','.tif'):
+                if _sips_convert(fp, thumb_path, 300, "png"):
+                    return True
+            # Default path: qlmanage handles videos + most images.
+            if _qlmanage_thumb(fp, thumb_path):
+                return True
+            # Last resort for any still image.
+            if ext in EXTENSIONS_IMG:
+                if _sips_convert(fp, thumb_path, 300, "png"):
+                    return True
+    except Exception:
+        pass
+    finally:
+        with _THUMB_LOCK:
+            _THUMB_INFLIGHT.pop(thumb_path, None)
+        ev.set()
+    return False
+
+_PREVIEW_LOCK = threading.Lock()
+_PREVIEW_INFLIGHT = {}
+
+def generate_preview(fp, preview_path, size=1600):
+    """Medium-res JPEG (~1600px) for lightbox view. Generated on-demand; for
+    1000 images we never want to pre-generate these — cache builds as users
+    tap."""
+    with _PREVIEW_LOCK:
+        ev = _PREVIEW_INFLIGHT.get(preview_path)
+        if ev is not None:
+            owner = False
+        else:
+            ev = threading.Event()
+            _PREVIEW_INFLIGHT[preview_path] = ev
+            owner = True
+    if not owner:
+        ev.wait(timeout=90)
+        return os.path.exists(preview_path)
+    try:
+        os.makedirs(os.path.dirname(preview_path), exist_ok=True)
+        with _PREVIEW_SEM:
+            if _sips_convert(fp, preview_path, size, "jpeg", quality=82):
+                return True
+    except Exception:
+        pass
+    finally:
+        with _PREVIEW_LOCK:
+            _PREVIEW_INFLIGHT.pop(preview_path, None)
+        ev.set()
     return False
 
 # ─── QR Code SVG ───
@@ -363,15 +464,21 @@ def get_thumb_path(rel_path):
         return os.path.join(THUMB_DIR, safe + "_thumb.png")
     return None
 
-def _gen_all_thumbs():
-    if not state.folder: return
-    files = scan_all_files(state.folder)
-    for fi in files:
-        if fi["type"] in ("video", "image"):
-            thumb = get_thumb_path(fi["rel"])
-            if thumb and not os.path.exists(thumb):
-                fp = os.path.join(state.folder, fi["rel"])
-                generate_thumbnail(fp, thumb)
+def get_preview_path(rel_path):
+    if THUMB_DIR:
+        safe = rel_path.replace(os.sep, "_").replace("/", "_")
+        return os.path.join(THUMB_DIR, safe + "_preview.jpg")
+    return None
+
+# Image types all browsers render natively; for these we can serve the
+# original file for the lightbox (no transcoding = full quality, and
+# phones handle 10–20 MB JPGs fine). Everything else must go through sips.
+WEB_NATIVE_IMG = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg'}
+
+# Thumbs are generated on demand (HTTP /thumb/ request) and cached on disk.
+# Bulk pre-generation was removed: with 2k RAWs it saturated sips for 30+ min
+# and blocked lightbox previews. Browser lazy-loading + inflight dedup already
+# give us "many phones scrolling the same grid" for free via the cache.
 
 
 # ─── Página de download (celular) ───
@@ -458,7 +565,7 @@ function toggleAll() {
   updateSelectionUI();
 }
 
-async function downloadSelected(e) {
+function downloadSelected(e) {
   e.preventDefault();
   var picks = [];
   for (var i = 0; i < FILE_LIST.length; i++) {
@@ -468,27 +575,219 @@ async function downloadSelected(e) {
   var prog = document.getElementById('dl-progress');
   var bar = document.getElementById('dl-bar');
   var txt = document.getElementById('dl-text');
-  prog.style.display = 'block';
-  for (var i = 0; i < picks.length; i++) {
-    var f = picks[i];
-    txt.textContent = 'Baixando ' + (i+1) + '/' + picks.length + ': ' + f.name;
-    bar.style.width = Math.round((i / picks.length) * 100) + '%';
+  if (picks.length === 1) {
+    // Single file: native download link (keeps filename + lets iOS show
+    // the usual "Download" prompt at the bottom of Safari).
+    var f = picks[0];
     var a = document.createElement('a');
     a.href = '/dl/' + encodeURIComponent(f.rel);
     a.download = f.name;
-    a.style.display = 'none';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    await new Promise(function(r) { setTimeout(r, 800); });
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    prog.style.display = 'block';
+    bar.style.width = '100%';
+    txt.textContent = '\\u2B07 Baixando ' + f.name;
+    setTimeout(function(){ prog.style.display='none'; }, 3000);
+    return;
   }
-  bar.style.width = '100%';
-  txt.textContent = '\\u2705 ' + picks.length + ' download(s) iniciado(s)!';
-  setTimeout(function() { prog.style.display = 'none'; }, 4000);
+  // Multi-file: synchronous form POST in the user-gesture. Server streams
+  // back a ZIP with Content-Disposition: attachment, so Safari triggers
+  // a single download instead of fighting us over N separate clicks.
+  var zipName = 'oceanshare-' + picks.length + '-arquivos.zip';
+  prog.style.display = 'block';
+  bar.style.width = '40%';
+  txt.textContent = '\\u23F3 Preparando ZIP (' + picks.length + ' arquivos)... aguarde';
+  var form = document.createElement('form');
+  form.method = 'POST';
+  form.action = '/zip';
+  form.acceptCharset = 'UTF-8';
+  form.enctype = 'application/x-www-form-urlencoded';
+  var fi = document.createElement('input');
+  fi.type = 'hidden'; fi.name = 'files';
+  fi.value = JSON.stringify(picks.map(function(p){ return p.rel; }));
+  form.appendChild(fi);
+  var fn = document.createElement('input');
+  fn.type = 'hidden'; fn.name = 'name'; fn.value = zipName;
+  form.appendChild(fn);
+  document.body.appendChild(form);
+  form.submit();
+  setTimeout(function(){
+    try { document.body.removeChild(form); } catch(e) {}
+    bar.style.width = '100%';
+    txt.textContent = '\\u2B07 Baixando ' + zipName;
+    setTimeout(function(){ prog.style.display='none'; }, 5000);
+  }, 500);
 }
 
 for (var i = 0; i < FILE_LIST.length; i++) SELECTED[FILE_LIST[i].rel] = false;
 updateSelectionUI();
+
+// Infinite scroll: reveal cards in batches as the user nears the sentinel.
+// With 2k photos we start with 120 visible, then auto-reveal ~120 per scroll
+// step when the sentinel enters a 600px lookahead margin. Each newly-shown
+// card's <img loading="lazy" decoding="async"> only hits /thumb/ once it's
+// actually near the viewport, so generation/cache build up progressively.
+function showMore() {
+  var btn = document.getElementById('more-btn');
+  if (!btn) return;
+  var ps = parseInt(btn.getAttribute('data-page-size') || '120', 10);
+  var hidden = document.querySelectorAll('.card.hidden-card');
+  var n = Math.min(ps, hidden.length);
+  for (var i = 0; i < n; i++) hidden[i].classList.remove('hidden-card');
+  var remaining = hidden.length - n;
+  if (remaining <= 0) btn.style.display = 'none';
+  else btn.textContent = 'Carregando... (' + remaining + ' restantes)';
+}
+
+(function setupInfiniteScroll() {
+  if (!('IntersectionObserver' in window)) return;
+  var btn = document.getElementById('more-btn');
+  if (!btn) return;
+  var io = new IntersectionObserver(function(entries) {
+    for (var i = 0; i < entries.length; i++) {
+      if (entries[i].isIntersecting) {
+        showMore();
+        if (!document.querySelectorAll('.card.hidden-card').length) {
+          io.disconnect();
+          return;
+        }
+      }
+    }
+  }, { rootMargin: '600px 0px' });
+  io.observe(btn);
+})();
+
+// "Salvar em Fotos" via Web Share API. Only reveals the button when the
+// browser actually supports sharing Files (Safari 15+ on iOS/iPadOS).
+// Falls back to a regular download elsewhere.
+(function(){
+  try {
+    var probe = new File([new Blob(['x'])], 'x.jpg', {type:'image/jpeg'});
+    if (navigator.canShare && navigator.canShare({files:[probe]})) {
+      document.body.classList.add('can-share');
+    }
+  } catch(e) {}
+})();
+
+async function saveToPhotos(btn){
+  var url = btn.getAttribute('data-url');
+  var name = btn.getAttribute('data-name');
+  var ftype = btn.getAttribute('data-type');
+  var orig = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '\\u23F3 Baixando...';
+  try {
+    var resp = await fetch(url);
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    // Progress via streaming reader when available (Content-Length known).
+    var total = parseInt(resp.headers.get('Content-Length') || '0', 10);
+    var reader = resp.body && resp.body.getReader ? resp.body.getReader() : null;
+    var blob;
+    if (reader && total > 0) {
+      var chunks = []; var got = 0;
+      while (true) {
+        var r = await reader.read();
+        if (r.done) break;
+        chunks.push(r.value); got += r.value.length;
+        var pct = Math.round(got * 100 / total);
+        btn.innerHTML = '\\u23F3 Baixando ' + pct + '%';
+      }
+      blob = new Blob(chunks, {type: resp.headers.get('Content-Type') || 'application/octet-stream'});
+    } else {
+      blob = await resp.blob();
+    }
+    var file = new File([blob], name, {type: blob.type});
+    if (!(navigator.canShare && navigator.canShare({files:[file]}))) {
+      throw new Error('share-unsupported');
+    }
+    btn.innerHTML = '\\u{1F4E4} Abrindo...';
+    await navigator.share({files:[file]});
+    btn.innerHTML = '\\u2705 Salvo!';
+  } catch(err) {
+    if (err && err.name === 'AbortError') {
+      btn.innerHTML = orig;
+    } else {
+      // Fallback: normal download
+      var a = document.createElement('a');
+      a.href = url; a.download = name;
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      btn.innerHTML = '\\u2B07 Baixado';
+    }
+  } finally {
+    setTimeout(function(){ btn.innerHTML = orig; btn.disabled = false; }, 3000);
+  }
+}
+
+// ── Lightbox: tap image thumb -> open full-res preview ──
+var _lbCur = null;
+
+function openLightbox(rel, enc, name) {
+  _lbCur = {rel: rel, enc: enc, name: name};
+  var lb = document.getElementById('lightbox');
+  var img = document.getElementById('lb-img');
+  var spin = document.getElementById('lb-spinner');
+  var title = document.getElementById('lb-title');
+  var dl = document.getElementById('lb-dl');
+  var save = document.getElementById('lb-save');
+  title.textContent = name;
+  dl.href = '/dl/' + enc;
+  dl.setAttribute('download', name);
+  // Hide "Salvar em Fotos" if Web Share API is unavailable.
+  save.style.display = document.body.classList.contains('can-share') ? '' : 'none';
+  img.classList.remove('ready');
+  img.removeAttribute('src');
+  spin.style.display = 'flex';
+  // Any prior error message is cleared.
+  var existingErr = lb.querySelector('.lb-error');
+  if (existingErr) existingErr.remove();
+  lb.classList.add('on');
+  document.body.classList.add('lb-open');
+  img.onload = function() {
+    spin.style.display = 'none';
+    img.classList.add('ready');
+  };
+  img.onerror = function() {
+    spin.style.display = 'none';
+    var err = document.createElement('div');
+    err.className = 'lb-error';
+    err.textContent = 'Não foi possível gerar o preview deste arquivo.';
+    lb.querySelector('.lb-body').appendChild(err);
+  };
+  img.src = '/preview/' + enc;
+}
+
+function closeLightbox() {
+  var lb = document.getElementById('lightbox');
+  var img = document.getElementById('lb-img');
+  lb.classList.remove('on');
+  document.body.classList.remove('lb-open');
+  img.removeAttribute('src');
+  img.classList.remove('ready');
+  _lbCur = null;
+}
+
+function lbSave() {
+  if (!_lbCur) return;
+  // Reuse the Share-API flow from per-card buttons.
+  var btn = document.getElementById('lb-save');
+  btn.setAttribute('data-url', '/dl/' + _lbCur.enc);
+  btn.setAttribute('data-name', _lbCur.name);
+  btn.setAttribute('data-type', 'image');
+  saveToPhotos(btn);
+}
+
+document.addEventListener('click', function(e) {
+  var el = e.target.closest('.clickable-img');
+  if (!el) return;
+  e.preventDefault();
+  openLightbox(el.dataset.rel, el.dataset.enc, el.dataset.name);
+});
+
+// ESC closes the lightbox (useful in desktop Safari too).
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Escape' && document.getElementById('lightbox').classList.contains('on')) {
+    closeLightbox();
+  }
+});
 </script></body></html>"""
 
 
@@ -512,25 +811,40 @@ def build_download_page(subpath=""):
             <span class="folder-info"><span class="folder-name">{d["name"]}</span>
             <span class="folder-count">{d["count"]} arquivo{"s" if d["count"]!=1 else ""}</span></span>
             <span class="folder-arrow">›</span></a>'''
-    for fi in files:
+    PAGE_SIZE = 120
+    for idx, fi in enumerate(files):
         enc = urllib.parse.quote(fi["rel"])
         rel_attr = fi["rel"].replace('"', '&quot;')
         icon = "🎬" if fi["type"]=="video" else "🖼️" if fi["type"]=="image" else "📄"
+        hidden_cls = ' hidden-card' if idx >= PAGE_SIZE else ''
         if fi["type"] == "video":
             preview = f'''<div class="preview" id="p_{hash(fi["rel"])%99999}" onclick="var el=this;if(el.dataset.playing)return;el.dataset.playing='1';el.classList.add('playing');var v=document.createElement('video');v.src='/dl/{enc}';v.controls=true;v.autoplay=true;v.playsInline=true;v.setAttribute('playsinline','');v.setAttribute('webkit-playsinline','');v.style.cssText='width:100%;max-height:70vh;object-fit:contain;background:#000;border-radius:12px';el.innerHTML='';el.appendChild(v);el.onclick=null">
-                <img src="/thumb/{enc}" onerror="this.parentElement.innerHTML='{icon}'" loading="lazy">
+                <img src="/thumb/{enc}" onerror="this.parentElement.innerHTML='{icon}'" loading="lazy" decoding="async">
                 <div class="play-overlay"><div class="play-circle">▶</div></div></div>'''
         elif fi["type"] == "image":
-            preview = f'<div class="preview"><img src="/thumb/{enc}" onerror="this.parentElement.innerHTML=\'🖼️\'" loading="lazy"></div>'
+            # data-rel + delegated click handler so filenames with quotes stay safe.
+            preview = f'<div class="preview clickable-img" data-rel="{rel_attr}" data-enc="{enc}" data-name="{fi["name"].replace(chr(34),"&quot;")}"><img src="/thumb/{enc}" onerror="this.parentElement.innerHTML=\'🖼️\'" loading="lazy" decoding="async"></div>'
         else:
             preview = f'<div class="preview no-img">{icon}</div>'
-        cards += f'''<div class="card" data-rel="{rel_attr}">
+        name_attr = fi["name"].replace('"', '&quot;')
+        share_btn = ''
+        if fi["type"] in ("video", "image"):
+            share_btn = f'<button class="save-photos" data-url="/dl/{enc}" data-name="{name_attr}" data-type="{fi["type"]}" onclick="event.preventDefault();event.stopPropagation();saveToPhotos(this)">📸 Salvar em Fotos</button>'
+        cards += f'''<div class="card{hidden_cls}" data-rel="{rel_attr}" data-idx="{idx}">
             <label class="select-chk" onclick="event.stopPropagation()"><input type="checkbox" class="file-chk" data-rel="{rel_attr}" onchange="onItemToggle(this)"><span class="chk-box"></span></label>
             {preview}
-            <a class="dl" href="/dl/{enc}" download>
-            <span class="fname">{fi["name"]}</span>
-            <span class="meta"><span class="fdate">{fi["date"]}</span><span class="fsize">{fi["size"]}</span>
-            <span class="dl-btn">⬇ Baixar</span></span></a></div>'''
+            <div class="card-body">
+              <span class="fname">{fi["name"]}</span>
+              <span class="meta"><span class="fdate">{fi["date"]}</span><span class="fsize">{fi["size"]}</span></span>
+              <div class="card-actions">
+                <a class="dl-btn" href="/dl/{enc}" download="{name_attr}">⬇ Baixar</a>
+                {share_btn}
+              </div>
+            </div></div>'''
+
+    if len(files) > PAGE_SIZE:
+        remaining = len(files) - PAGE_SIZE
+        cards += f'<button id="more-btn" class="show-more" data-page-size="{PAGE_SIZE}" onclick="showMore()">Mostrar mais ({remaining} restantes)</button>'
     title = os.path.basename(subpath) if subpath else "OceanShare"
     subtitle = f"📁 {subpath}" if subpath else "Toque pra assistir ou baixar"
     return f"""<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8">
@@ -622,21 +936,76 @@ display:flex;align-items:center;justify-content:center;overflow:hidden;cursor:po
 .preview.playing{{aspect-ratio:auto;min-height:200px}}
 .preview img{{width:100%;height:100%;object-fit:cover}}
 .preview.no-img{{background:rgba(15,23,42,.8)}}
+.preview.clickable-img{{cursor:zoom-in}}
+.preview.clickable-img:active img{{opacity:.85}}
+
+/* ── Lightbox overlay (tap image to enlarge) ── */
+#lightbox{{position:fixed;inset:0;z-index:1000;background:rgba(4,6,14,.97);
+display:none;flex-direction:column;padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom) 0}}
+#lightbox.on{{display:flex}}
+body.lb-open{{overflow:hidden}}
+.lb-top{{display:flex;align-items:center;gap:10px;padding:14px 16px;flex-shrink:0}}
+.lb-title{{flex:1;min-width:0;color:#e2e8f0;font-size:.92em;font-weight:600;
+overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+.lb-close{{background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.15);
+color:#fff;width:40px;height:40px;border-radius:50%;font-size:1.1em;cursor:pointer;
+display:flex;align-items:center;justify-content:center;flex-shrink:0;
+-webkit-tap-highlight-color:transparent}}
+.lb-close:active{{transform:scale(.92)}}
+.lb-body{{flex:1;display:flex;align-items:center;justify-content:center;
+position:relative;overflow:hidden;min-height:0}}
+.lb-body img{{max-width:100%;max-height:100%;object-fit:contain;
+opacity:0;transition:opacity .2s}}
+.lb-body img.ready{{opacity:1}}
+.lb-spinner{{position:absolute;color:#94a3b8;font-size:.92em;display:flex;
+flex-direction:column;align-items:center;gap:12px}}
+.lb-spinner .sp{{width:44px;height:44px;border:3px solid rgba(255,255,255,.1);
+border-top-color:var(--accent);border-radius:50%;animation:lbspin .8s linear infinite}}
+@keyframes lbspin{{to{{transform:rotate(360deg)}}}}
+.lb-error{{color:#f87171;font-size:.9em;text-align:center;padding:20px}}
+.lb-bottom{{display:flex;gap:10px;padding:14px 16px;flex-shrink:0}}
+.lb-btn{{flex:1;background:rgba(255,255,255,.06);color:#e2e8f0;
+border:1px solid rgba(255,255,255,.1);padding:12px;border-radius:12px;
+font-size:.88em;font-weight:600;cursor:pointer;text-decoration:none;text-align:center;
+-webkit-tap-highlight-color:transparent}}
+.lb-btn:active{{transform:scale(.97)}}
+.lb-btn.primary{{background:linear-gradient(135deg,#0ea5e9,#0284c7);
+color:#fff;border:none;box-shadow:0 2px 10px rgba(14,165,233,.28)}}
 .play-overlay{{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
 background:linear-gradient(to top,rgba(0,0,0,.4),transparent);pointer-events:none}}
 .play-circle{{width:52px;height:52px;border-radius:50%;
 background:rgba(255,255,255,.18);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
 border:1.5px solid rgba(255,255,255,.25);display:flex;align-items:center;justify-content:center;
 font-size:.6em;color:#fff;padding-left:3px}}
-.dl{{display:flex;flex-wrap:wrap;align-items:center;padding:14px 16px;text-decoration:none;color:#e2e8f0;gap:4px}}
-.dl:active{{background:rgba(255,255,255,.04)}}
+.card-body{{display:flex;flex-direction:column;padding:14px 16px;gap:6px}}
 .fname{{width:100%;font-size:.88em;font-weight:500;word-break:break-all}}
-.meta{{display:flex;width:100%;justify-content:space-between;align-items:center;margin-top:5px}}
+.meta{{display:flex;width:100%;justify-content:space-between;align-items:center;margin-top:2px}}
 .fsize{{color:#94a3b8;font-size:.78em}}
 .fdate{{color:#64748b;font-size:.75em}}
-.dl-btn{{background:linear-gradient(135deg,#0ea5e9,#0284c7);color:white;padding:7px 16px;
-border-radius:10px;font-size:.78em;font-weight:600;box-shadow:0 2px 10px rgba(14,165,233,.25)}}
+.card-actions{{display:flex;gap:8px;margin-top:6px;flex-wrap:wrap}}
+.dl-btn{{flex:1;min-width:110px;text-align:center;background:rgba(255,255,255,.05);
+color:#e2e8f0;padding:10px 14px;border-radius:10px;font-size:.82em;font-weight:600;
+border:1px solid rgba(255,255,255,.1);text-decoration:none;cursor:pointer;
+transition:.15s;-webkit-tap-highlight-color:transparent}}
+.dl-btn:active{{transform:scale(.97);background:rgba(255,255,255,.08)}}
+.save-photos{{flex:1;min-width:130px;background:linear-gradient(135deg,#0ea5e9,#0284c7);
+color:white;padding:10px 14px;border-radius:10px;font-size:.82em;font-weight:700;
+border:none;cursor:pointer;box-shadow:0 2px 10px rgba(14,165,233,.28);
+display:none;align-items:center;justify-content:center;gap:6px;
+-webkit-tap-highlight-color:transparent;transition:.15s}}
+.save-photos:active{{transform:scale(.97)}}
+.save-photos:disabled{{opacity:.6;background:#475569;box-shadow:none;cursor:default}}
+body.can-share .save-photos{{display:inline-flex}}
 .empty{{text-align:center;color:#94a3b8;margin-top:50px;font-size:.9em}}
+
+/* pagination: collapses 1000-card grids on mobile (each hidden card costs layout time) */
+.card.hidden-card{{display:none}}
+.show-more{{display:block;width:100%;padding:16px;margin:8px 0 4px 0;
+background:rgba(56,189,248,.08);border:1px solid rgba(56,189,248,.2);
+color:var(--accent);border-radius:14px;font-size:.92em;font-weight:600;cursor:pointer;
+backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);transition:.15s;
+-webkit-tap-highlight-color:transparent}}
+.show-more:active{{transform:scale(.98);background:rgba(56,189,248,.14)}}
 
 /* download all */
 .dl-all{{display:flex;align-items:center;justify-content:center;gap:8px;
@@ -670,6 +1039,20 @@ cursor:pointer;width:100%;max-width:500px;box-shadow:0 4px 16px rgba(139,92,246,
 {'''<div class="sel-bar"><div class="sel-count"><span id="sel-num">0</span> de ''' + str(len(files)) + ''' selecionado(s)</div><button class="sel-btn" id="btn-all" onclick="toggleAll()">Marcar tudo</button><button class="sel-btn primary" id="btn-dl-sel" onclick="downloadSelected(event)" disabled>⬇ Baixar</button></div><div class="dl-progress" id="dl-progress"><span class="prog-text" id="dl-text"></span><div class="prog-bar"><div class="prog-fill-dl" id="dl-bar"></div></div></div>''' if files else ''}
 {cards if cards else '<p class="empty">Nenhum arquivo encontrado.</p>'}
 </div>
+<div id="lightbox" onclick="if(event.target.id==='lightbox')closeLightbox()">
+  <div class="lb-top">
+    <div class="lb-title" id="lb-title"></div>
+    <button class="lb-close" onclick="closeLightbox()" aria-label="Fechar">✕</button>
+  </div>
+  <div class="lb-body">
+    <div class="lb-spinner" id="lb-spinner"><div class="sp"></div><div>Carregando preview...</div></div>
+    <img id="lb-img" alt="">
+  </div>
+  <div class="lb-bottom">
+    <a class="lb-btn" id="lb-dl" href="" download>⬇ Baixar original</a>
+    <button class="lb-btn primary" id="lb-save" onclick="lbSave()">📸 Salvar em Fotos</button>
+  </div>
+</div>
 <div class="upload-bar">
   <button class="upload-btn" onclick="document.getElementById('file-input').click()">📤 Enviar arquivo para o Mac</button>
   <input type="file" id="file-input" multiple accept="*/*" style="display:none" onchange="uploadFiles(this.files)">
@@ -683,8 +1066,45 @@ cursor:pointer;width:100%;max-width:500px;box-shadow:0 4px 16px rgba(139,92,246,
 
 # ─── Handler HTTP unificado ───
 
+class _HttpChunkWriter:
+    """Non-seekable file-like wrapper around an HTTP wfile.
+
+    When the underlying fp is non-seekable, zipfile writes per-entry data
+    descriptors instead of rewinding to patch the local header — exactly what
+    we need to stream a ZIP without buffering the whole thing.
+    """
+    def __init__(self, wfile):
+        self.wfile = wfile
+        self._pos = 0
+    def write(self, b):
+        if not b:
+            return 0
+        self.wfile.write(b)
+        self._pos += len(b)
+        return len(b)
+    def tell(self):
+        return self._pos
+    def seekable(self):
+        return False
+    def flush(self):
+        try: self.wfile.flush()
+        except Exception: pass
+
+
 class UnifiedHandler(http.server.BaseHTTPRequestHandler):
+    # HTTP/1.1 + keep-alive: reuses sockets across thumb/range requests,
+    # avoiding ~100ms handshake per thumbnail on iOS Safari.
+    protocol_version = "HTTP/1.1"
+
     def log_message(self, *a): pass
+
+    def setup(self):
+        super().setup()
+        try:
+            self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2 * 1024 * 1024)
+        except Exception:
+            pass
 
     def do_GET(self):
         client_ip = self.client_address[0]
@@ -702,7 +1122,7 @@ class UnifiedHandler(http.server.BaseHTTPRequestHandler):
             self._api_received()
         elif is_admin and self.path.startswith('/api/'):
             pass  # POST only
-        elif not is_admin or self.path.startswith(('/browse', '/dl/', '/thumb/')):
+        elif not is_admin or self.path.startswith(('/browse', '/dl/', '/thumb/', '/preview/')):
             if not state.serving and not is_admin:
                 self._send_html("<h1>OceanShare ainda não está ligado</h1>"); return
             if self.path in ('/', ''):
@@ -717,6 +1137,8 @@ class UnifiedHandler(http.server.BaseHTTPRequestHandler):
                 self._send_html(build_download_page(""))
             elif self.path.startswith('/thumb/'):
                 self._serve_thumb(self.path[7:])
+            elif self.path.startswith('/preview/'):
+                self._serve_preview(self.path[9:])
             elif self.path.startswith('/dl/'):
                 self._serve_file(self.path[4:])
             elif self.path == '/favicon.ico':
@@ -734,12 +1156,13 @@ class UnifiedHandler(http.server.BaseHTTPRequestHandler):
         path = self.path; res = {}
         if path == '/upload':
             self._handle_upload(); return
+        if path == '/zip':
+            self._handle_zip(); return
         if path == '/api/choose_folder':
             folder = choose_folder_dialog()
             if folder:
                 state.folder = folder
                 ensure_thumb_dir()
-                threading.Thread(target=_gen_all_thumbs, daemon=True).start()
                 all_files = scan_all_files(folder)
                 res = {"folder": folder, "count": len(all_files)}
             else:
@@ -752,7 +1175,6 @@ class UnifiedHandler(http.server.BaseHTTPRequestHandler):
                 url = f"http://{ips[0]}:{PORT}"
                 alts = [{"url": f"http://{ip}:{PORT}", "qr": make_qr_svg(f"http://{ip}:{PORT}") or ""} for ip in ips[1:]]
                 qr = make_qr_svg(url) or ""
-                threading.Thread(target=_gen_all_thumbs, daemon=True).start()
                 res = {"ok": True, "url": url, "qr": qr, "alts": alts}
             else:
                 res = {"ok": False, "error": "Escolha uma pasta primeiro"}
@@ -789,11 +1211,119 @@ class UnifiedHandler(http.server.BaseHTTPRequestHandler):
 
     def _send_html(self, html):
         d = html.encode() if isinstance(html, str) else html
+        # gzip when the client supports it. With 2k-file folders the download
+        # page is ~2.6 MB of repetitive card HTML — compresses ~12× to ~200 KB.
+        accept = self.headers.get('Accept-Encoding', '') or ''
+        use_gzip = 'gzip' in accept and len(d) > 1024
+        if use_gzip:
+            import gzip
+            d = gzip.compress(d, compresslevel=5)
         self.send_response(200)
         self.send_header('Content-Type','text/html;charset=utf-8')
+        if use_gzip:
+            self.send_header('Content-Encoding', 'gzip')
         self.send_header('Content-Length',str(len(d)))
         self.end_headers()
         self.wfile.write(d)
+
+    def _handle_zip(self):
+        """Stream a ZIP of selected files. iOS Safari blocks consecutive
+        a.click() downloads — one ZIP is the only reliable way to grab
+        N files in a single user gesture."""
+        if not state.folder:
+            self._send_json({"ok": False, "error": "Nenhuma pasta selecionada"})
+            return
+        try:
+            cl = int(self.headers.get('Content-Length', 0))
+        except Exception:
+            cl = 0
+        body = self.rfile.read(cl) if cl > 0 else b''
+        ct = self.headers.get('Content-Type', '')
+        rels = []
+        zip_name = "oceanshare.zip"
+        try:
+            if 'application/json' in ct:
+                data = json.loads(body.decode('utf-8'))
+                rels = data.get('files', []) or []
+                zip_name = data.get('name') or zip_name
+            else:
+                # form-urlencoded: files=<json-array>&name=...
+                form = urllib.parse.parse_qs(body.decode('utf-8'))
+                files_field = (form.get('files') or [''])[0]
+                if files_field:
+                    rels = json.loads(files_field)
+                zip_name = (form.get('name') or [zip_name])[0]
+        except Exception:
+            self._send_json({"ok": False, "error": "Payload inválido"})
+            return
+        if not rels:
+            self._send_json({"ok": False, "error": "Nenhum arquivo"})
+            return
+
+        # Validate: every rel must resolve inside state.folder.
+        root = os.path.realpath(state.folder)
+        safe = []
+        seen_names = {}
+        for rel in rels:
+            if not isinstance(rel, str): continue
+            fp = os.path.realpath(os.path.join(state.folder, rel))
+            if not fp.startswith(root + os.sep) and fp != root: continue
+            if not os.path.isfile(fp): continue
+            base = os.path.basename(fp)
+            # Avoid collisions in the ZIP when two files share a basename.
+            if base in seen_names:
+                seen_names[base] += 1
+                stem, ext = os.path.splitext(base)
+                base = f"{stem}_{seen_names[base]}{ext}"
+            else:
+                seen_names[base] = 0
+            safe.append((fp, base))
+        if not safe:
+            self.send_error(404); return
+
+        # Keep-alive off: ZIP length isn't known ahead of time; connection
+        # close signals EOF. Simpler than chunked encoding, and Safari is
+        # happy with it when Content-Disposition is set.
+        self.close_connection = True
+        try:
+            safe_name = zip_name.replace('"', '').replace('\\', '')[:120] or "oceanshare.zip"
+            if not safe_name.lower().endswith('.zip'):
+                safe_name += '.zip'
+            transfer = state.add_transfer(safe_name, fmt_size(sum(os.path.getsize(fp) for fp, _ in safe)), "download")
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/zip')
+            self.send_header('Content-Disposition', f'attachment; filename="{safe_name}"')
+            self.send_header('Connection', 'close')
+            self.end_headers()
+            stream = _HttpChunkWriter(self.wfile)
+            total = sum(os.path.getsize(fp) for fp, _ in safe) or 1
+            sent_bytes = 0
+            # ZIP_STORED: video files are already compressed; skip the CPU cost.
+            with zipfile.ZipFile(stream, mode='w', compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
+                for fp, arcname in safe:
+                    try:
+                        info = zipfile.ZipInfo(arcname)
+                        info.compress_type = zipfile.ZIP_STORED
+                        info.file_size = os.path.getsize(fp)
+                        with open(fp, 'rb') as src, zf.open(info, 'w', force_zip64=True) as dst:
+                            while True:
+                                chunk = src.read(4 * 1024 * 1024)
+                                if not chunk: break
+                                try:
+                                    dst.write(chunk)
+                                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                                    return
+                                sent_bytes += len(chunk)
+                                if transfer:
+                                    transfer["progress"] = min(99, int(sent_bytes * 100 / total))
+                    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                        return
+                    except Exception:
+                        continue
+            if transfer:
+                state.finish_transfer(transfer)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            return
 
     def _handle_upload(self):
         if not state.folder:
@@ -936,16 +1466,10 @@ class UnifiedHandler(http.server.BaseHTTPRequestHandler):
                 self.send_header('Content-Length', str(length))
                 self.send_header('Accept-Ranges', 'bytes')
                 self.end_headers()
-                with open(fp, 'rb') as f:
-                    f.seek(start); rem = length
-                    while rem > 0:
-                        chunk = f.read(min(1024*1024, rem))
-                        if not chunk: break
-                        try: self.wfile.write(chunk)
-                        except: break
-                        rem -= len(chunk)
+                self._stream_file(fp, start, length)
                 return
-            except: pass
+            except Exception:
+                pass
         self.send_response(200)
         self.send_header('Content-Type', ct)
         self.send_header('Content-Length', str(sz))
@@ -954,18 +1478,61 @@ class UnifiedHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         if not is_admin:
             transfer = state.add_transfer(name, fmt_size(sz), "download")
-        sent = 0
-        with open(fp, 'rb') as f:
-            while True:
-                chunk = f.read(1024*1024)
-                if not chunk: break
-                try: self.wfile.write(chunk)
-                except: break
-                sent += len(chunk)
-                if transfer and sz > 0:
-                    transfer["progress"] = min(100, int(sent * 100 / sz))
+        self._stream_file(fp, 0, sz, transfer)
         if transfer:
             state.finish_transfer(transfer)
+
+    def _stream_file(self, fp, offset, length, transfer=None):
+        """Zero-copy send via os.sendfile when available, fallback to read/write.
+
+        Falls back cleanly on BrokenPipe (client closed early — common with
+        iOS Safari seeking in <video>).
+        """
+        try:
+            self.wfile.flush()
+        except Exception:
+            pass
+        try:
+            out_fd = self.connection.fileno()
+        except Exception:
+            out_fd = None
+        sent = 0
+        try:
+            f = open(fp, 'rb')
+        except Exception:
+            return
+        try:
+            if out_fd is not None and hasattr(os, 'sendfile'):
+                in_fd = f.fileno()
+                remaining = length
+                cur = offset
+                while remaining > 0:
+                    try:
+                        n = os.sendfile(out_fd, in_fd, cur, min(remaining, 4 * 1024 * 1024))
+                    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                        return
+                    except BlockingIOError:
+                        continue
+                    if n == 0:
+                        break
+                    cur += n; remaining -= n; sent += n
+                    if transfer and length > 0:
+                        transfer["progress"] = min(100, int(sent * 100 / length))
+                return
+            # Fallback: buffered copy
+            f.seek(offset)
+            remaining = length
+            while remaining > 0:
+                chunk = f.read(min(4 * 1024 * 1024, remaining))
+                if not chunk: break
+                try: self.wfile.write(chunk)
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError): return
+                remaining -= len(chunk); sent += len(chunk)
+                if transfer and length > 0:
+                    transfer["progress"] = min(100, int(sent * 100 / length))
+        finally:
+            try: f.close()
+            except Exception: pass
 
     def _serve_app_icon(self):
         if not os.path.isfile(ICON_PATH):
@@ -978,6 +1545,35 @@ class UnifiedHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         with open(ICON_PATH, 'rb') as f:
             self.wfile.write(f.read())
+
+    def _serve_preview(self, rel_encoded):
+        """Medium-res preview for lightbox tap. Serves the original for
+        web-native formats; otherwise transcodes with sips and caches."""
+        rel = urllib.parse.unquote(rel_encoded)
+        fp = os.path.realpath(os.path.join(state.folder, rel))
+        if not fp.startswith(os.path.realpath(state.folder)):
+            self.send_error(403); return
+        if not os.path.isfile(fp):
+            self.send_error(404); return
+        ext = os.path.splitext(fp)[1].lower()
+        if ext in WEB_NATIVE_IMG:
+            # Fall through to the regular download path (already zero-copy).
+            self._serve_file(rel_encoded); return
+        prev = get_preview_path(rel)
+        if not prev:
+            self.send_error(404); return
+        if not os.path.exists(prev):
+            generate_preview(fp, prev)
+        if os.path.exists(prev):
+            self.send_response(200)
+            self.send_header('Content-Type', 'image/jpeg')
+            psz = os.path.getsize(prev)
+            self.send_header('Content-Length', str(psz))
+            self.send_header('Cache-Control', 'max-age=86400')
+            self.end_headers()
+            self._stream_file(prev, 0, psz)
+        else:
+            self.send_error(404)
 
     def _serve_thumb(self, rel_encoded):
         rel = urllib.parse.unquote(rel_encoded)

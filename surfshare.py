@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-OceanShare 🌊 v5
+OceanShare 🌊 v6
 App nativo macOS com janela própria (pywebview).
 pip3 install pywebview
 """
@@ -8,9 +8,11 @@ pip3 install pywebview
 import http.server
 import socketserver
 import os
+import struct
 import sys
 import json
 import socket
+import tempfile
 import urllib.parse
 import subprocess
 import threading
@@ -61,12 +63,18 @@ class State:
         self.serving = False
         self.transfers = []
         self.received = []
+        # Per-request progress keyed by client-supplied tid. Populated by
+        # /dl/ and /zip handlers, read by the mobile page via /api/progress
+        # so phones can show live MB/% without relying on the browser's
+        # download UI.
+        self.progress = {}
         self._lock = threading.Lock()
         self.window = None
 
-    def add_transfer(self, name, size, direction):
+    def add_transfer(self, name, size, direction, path=""):
         with self._lock:
-            entry = {"name": name, "size": size, "progress": 0, "direction": direction, "ts": time.time()}
+            entry = {"name": name, "path": path, "size": size, "progress": 0,
+                     "direction": direction, "ts": time.time()}
             self.transfers.insert(0, entry)
             if len(self.transfers) > 50:
                 self.transfers = self.transfers[:50]
@@ -81,6 +89,35 @@ class State:
             self.received.insert(0, {"name": name, "size": size, "ts": time.time()})
             if len(self.received) > 50:
                 self.received = self.received[:50]
+
+    def progress_start(self, tid, name, total):
+        if not tid: return
+        with self._lock:
+            self.progress[tid] = {
+                "name": name, "sent": 0, "total": total,
+                "start_ts": time.time(), "done": False,
+            }
+            # Prune entries older than 60s to keep the dict bounded.
+            cutoff = time.time() - 60
+            stale = [k for k, v in self.progress.items()
+                     if v.get("done") and v.get("start_ts", 0) < cutoff]
+            for k in stale: self.progress.pop(k, None)
+
+    def progress_update(self, tid, sent):
+        if not tid: return
+        e = self.progress.get(tid)
+        if e is not None: e["sent"] = sent
+
+    def progress_finish(self, tid):
+        if not tid: return
+        e = self.progress.get(tid)
+        if e is not None:
+            e["sent"] = e["total"] or e["sent"]
+            e["done"] = True
+
+    def get_progress(self, tid):
+        if not tid: return None
+        return self.progress.get(tid)
 
 state = State()
 
@@ -224,6 +261,122 @@ _THUMB_SEM = threading.Semaphore(6)
 # one semaphore meant preview taps waited minutes for the thumb backlog.
 _PREVIEW_SEM = threading.Semaphore(3)
 
+def extract_embedded_jpeg(fp):
+    """Pull the largest embedded JPEG preview out of a TIFF-based RAW file
+    (.ARW/.NEF/.CR2/.CR3/.RAF/.RW2/.ORF/.DNG).
+
+    Every modern camera embeds a full-res JPEG alongside the sensor data so
+    the camera's LCD can show the shot instantly. Extracting that JPEG
+    bypasses Apple's ImageIO RAW codec entirely — on older macOS where sips
+    can't decode a newer ARW variant, this still works because we're just
+    slicing TIFF bytes. On newer macOS it's also an order of magnitude
+    faster than a full RAW decode (~30 ms vs ~1000 ms per file).
+
+    Returns JPEG bytes (starts with FFD8), or None if nothing found.
+    """
+    try:
+        with open(fp, 'rb') as f:
+            hdr = f.read(8)
+            if len(hdr) < 8:
+                return None
+            if hdr[:2] == b'II': endian = '<'
+            elif hdr[:2] == b'MM': endian = '>'
+            else: return None
+            if struct.unpack(endian + 'H', hdr[2:4])[0] not in (42, 43):
+                return None
+            first_ifd = struct.unpack(endian + 'I', hdr[4:8])[0]
+
+            # BFS over IFD0, SubIFDs, and IFD chain. Cap at 50 IFDs to avoid
+            # pathological loops from malformed files.
+            queue = [first_ifd]
+            visited = set()
+            candidates = []  # list of (length, offset)
+            while queue and len(visited) < 50:
+                off = queue.pop(0)
+                if off in visited or off == 0 or off > 2**31:
+                    continue
+                visited.add(off)
+                f.seek(off)
+                nb = f.read(2)
+                if len(nb) < 2:
+                    continue
+                n = struct.unpack(endian + 'H', nb)[0]
+                if n > 1000:  # sanity
+                    continue
+                entries = f.read(n * 12)
+                if len(entries) < n * 12:
+                    continue
+                next_ifd_bytes = f.read(4)
+
+                comp = None
+                strip_off = strip_size = None
+                jpeg_off = jpeg_len = None
+                for i in range(n):
+                    e = entries[i*12:(i+1)*12]
+                    tag = struct.unpack(endian + 'H', e[0:2])[0]
+                    num = struct.unpack(endian + 'I', e[4:8])[0]
+                    val = struct.unpack(endian + 'I', e[8:12])[0]
+                    if tag == 0x0103:  # Compression
+                        comp = struct.unpack(endian + 'H', e[8:10])[0]
+                    elif tag == 0x0111 and num == 1:  # StripOffsets
+                        strip_off = val
+                    elif tag == 0x0117 and num == 1:  # StripByteCounts
+                        strip_size = val
+                    elif tag == 0x0201:  # JPEGInterchangeFormat
+                        jpeg_off = val
+                    elif tag == 0x0202:  # JPEGInterchangeFormatLength
+                        jpeg_len = val
+                    elif tag == 0x014A:  # SubIFDs
+                        if num == 1:
+                            queue.append(val)
+                        else:
+                            saved = f.tell()
+                            f.seek(val)
+                            for _ in range(min(num, 10)):
+                                b = f.read(4)
+                                if len(b) < 4:
+                                    break
+                                queue.append(struct.unpack(endian + 'I', b)[0])
+                            f.seek(saved)
+
+                if comp in (6, 7) and strip_off and strip_size and strip_size > 1024:
+                    candidates.append((strip_size, strip_off))
+                elif jpeg_off and jpeg_len and jpeg_len > 1024:
+                    candidates.append((jpeg_len, jpeg_off))
+
+                nxt = struct.unpack(endian + 'I', next_ifd_bytes)[0]
+                if nxt and nxt not in visited:
+                    queue.append(nxt)
+
+            if not candidates:
+                return None
+            # Largest wins — that's the full-res preview.
+            candidates.sort(key=lambda x: -x[0])
+            length, offset = candidates[0]
+            f.seek(offset)
+            data = f.read(length)
+            return data if len(data) >= 2 and data[:2] == b'\xff\xd8' else None
+    except Exception:
+        return None
+
+
+def _convert_via_embedded(fp, out_path, size, fmt, quality=None):
+    """For RAW files, skip ImageIO's RAW decoder: pull the embedded JPEG,
+    hand that to sips to resize/reformat. sips handling of plain JPEG is
+    rock-solid across macOS versions — the decoding side is what breaks on
+    older Macs with newer camera firmware."""
+    jpg = extract_embedded_jpeg(fp)
+    if not jpg:
+        return False
+    tf = tempfile.NamedTemporaryFile(suffix='.jpg', delete=False)
+    try:
+        tf.write(jpg); tf.close()
+        return _sips_convert(tf.name, out_path, size, fmt, quality)
+    finally:
+        try: os.unlink(tf.name)
+        except Exception: pass
+
+
 def _sips_convert(fp, out_path, size, fmt="png", quality=None):
     """Convert fp -> out_path using macOS sips (ImageIO RAW codec).
 
@@ -278,7 +431,12 @@ def generate_thumbnail(fp, thumb_path):
         os.makedirs(os.path.dirname(thumb_path), exist_ok=True)
         ext = os.path.splitext(fp)[1].lower()
         with _THUMB_SEM:
-            # For camera RAW / HEIC / TIFF, sips is more reliable than qlmanage.
+            # RAW: pull the embedded full-res JPEG and let sips resize that.
+            # Skips ImageIO's RAW codec entirely — works on any macOS version
+            # and is ~30× faster than a full RAW decode.
+            if ext in RAW_EXTS and _convert_via_embedded(fp, thumb_path, 300, "png"):
+                return True
+            # HEIC / TIFF / direct RAW decode: sips still more reliable than qlmanage.
             if ext in ('.arw','.nef','.cr2','.cr3','.raf','.rw2','.orf','.dng','.raw','.heic','.heif','.tiff','.tif'):
                 if _sips_convert(fp, thumb_path, 300, "png"):
                     return True
@@ -299,6 +457,46 @@ def generate_thumbnail(fp, thumb_path):
 
 _PREVIEW_LOCK = threading.Lock()
 _PREVIEW_INFLIGHT = {}
+_JPEG_LOCK = threading.Lock()
+_JPEG_INFLIGHT = {}
+# Separate lane so an Android phone requesting a 3000px JPEG doesn't stall
+# the scroll-driven thumb queue.
+_JPEG_SEM = threading.Semaphore(3)
+
+# Camera RAW file types — Android gallery apps (and most desktop viewers)
+# can't decode these natively, so we offer a rendered JPEG for "Baixar".
+RAW_EXTS = {'.arw','.nef','.cr2','.cr3','.raf','.rw2','.orf','.dng','.raw'}
+
+def generate_jpeg(fp, jpg_path, size=3000, quality=85):
+    """Render RAW (or any sips-readable file) to a gallery-friendly JPEG.
+    Cached on disk. Size 3000px covers phone viewing + reasonable zoom
+    without hitting the 20 MB that a full-res rendering would produce."""
+    with _JPEG_LOCK:
+        ev = _JPEG_INFLIGHT.get(jpg_path)
+        if ev is not None:
+            owner = False
+        else:
+            ev = threading.Event()
+            _JPEG_INFLIGHT[jpg_path] = ev
+            owner = True
+    if not owner:
+        ev.wait(timeout=120)
+        return os.path.exists(jpg_path)
+    try:
+        os.makedirs(os.path.dirname(jpg_path), exist_ok=True)
+        ext = os.path.splitext(fp)[1].lower()
+        with _JPEG_SEM:
+            if ext in RAW_EXTS and _convert_via_embedded(fp, jpg_path, size, "jpeg", quality=quality):
+                return True
+            if _sips_convert(fp, jpg_path, size, "jpeg", quality=quality):
+                return True
+    except Exception:
+        pass
+    finally:
+        with _JPEG_LOCK:
+            _JPEG_INFLIGHT.pop(jpg_path, None)
+        ev.set()
+    return False
 
 def generate_preview(fp, preview_path, size=1600):
     """Medium-res JPEG (~1600px) for lightbox view. Generated on-demand; for
@@ -317,7 +515,10 @@ def generate_preview(fp, preview_path, size=1600):
         return os.path.exists(preview_path)
     try:
         os.makedirs(os.path.dirname(preview_path), exist_ok=True)
+        ext = os.path.splitext(fp)[1].lower()
         with _PREVIEW_SEM:
+            if ext in RAW_EXTS and _convert_via_embedded(fp, preview_path, size, "jpeg", quality=82):
+                return True
             if _sips_convert(fp, preview_path, size, "jpeg", quality=82):
                 return True
     except Exception:
@@ -470,6 +671,12 @@ def get_preview_path(rel_path):
         return os.path.join(THUMB_DIR, safe + "_preview.jpg")
     return None
 
+def get_jpeg_path(rel_path):
+    if THUMB_DIR:
+        safe = rel_path.replace(os.sep, "_").replace("/", "_")
+        return os.path.join(THUMB_DIR, safe + "_full.jpg")
+    return None
+
 # Image types all browsers render natively; for these we can serve the
 # original file for the lightbox (no transcoding = full quality, and
 # phones handle 10–20 MB JPGs fine). Everything else must go through sips.
@@ -490,35 +697,141 @@ def _build_download_script(files):
     return """<script>
 var FILE_LIST = """ + file_list_js + """;
 
+// ────────── Activity panel: uploads + downloads com progresso ──────────
+var _acts = {};
+
+function _fmtSize(b) {
+  if (b == null || isNaN(b)) return '—';
+  var u = ['B','KB','MB','GB','TB'], i = 0;
+  while (b >= 1024 && i < u.length - 1) { b /= 1024; i++; }
+  return (b < 10 ? b.toFixed(1) : b.toFixed(0)) + ' ' + u[i];
+}
+function _fmtTime(s) {
+  if (!isFinite(s) || s <= 0) return '—';
+  if (s < 60) return Math.round(s) + 's';
+  if (s < 3600) return Math.floor(s/60) + 'min ' + Math.round(s%60) + 's';
+  return Math.floor(s/3600) + 'h ' + Math.round((s%3600)/60) + 'min';
+}
+function _esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];});}
+
+function _showPanel() {
+  var p = document.getElementById('activity-panel');
+  if (p) p.classList.remove('hidden');
+}
+function _hidePanelIfEmpty() {
+  if (Object.keys(_acts).length === 0) {
+    var p = document.getElementById('activity-panel');
+    if (p) p.classList.add('hidden');
+  }
+}
+function toggleActivityPanel() {
+  document.getElementById('activity-panel').classList.toggle('minimized');
+}
+
+function actStart(id, name, direction) {
+  // direction: 'dn' (download) or 'up' (upload)
+  var items = document.getElementById('act-items');
+  if (!items) return null;
+  var el = document.createElement('div');
+  el.className = 'act-item ' + direction;
+  el.innerHTML =
+    '<div class="act-row">' +
+      '<span class="act-ic">' + (direction === 'up' ? '\\u2B06' : '\\u2B07') + '</span>' +
+      '<div class="act-name"></div>' +
+      '<span class="act-pct">0%</span>' +
+    '</div>' +
+    '<div class="act-bar"><div class="act-bar-fill"></div></div>' +
+    '<div class="act-meta"><span class="m-size">—</span></div>';
+  el.querySelector('.act-name').textContent = name;
+  items.appendChild(el);
+  _acts[id] = { el: el, name: name, direction: direction, start: Date.now() };
+  _showPanel();
+  return _acts[id];
+}
+
+function actUpdate(id, sent, total, rateHint) {
+  var a = _acts[id]; if (!a) return;
+  total = total || 0;
+  var pct = total > 0 ? Math.min(100, sent / total * 100) : 0;
+  a.el.querySelector('.act-pct').textContent = pct.toFixed(0) + '%';
+  a.el.querySelector('.act-bar-fill').style.width = pct + '%';
+  var elapsed = (Date.now() - a.start) / 1000;
+  var rate = rateHint != null ? rateHint : (elapsed > 0 ? sent / elapsed : 0);
+  var eta = (rate > 0 && total > sent) ? (total - sent) / rate : 0;
+  var m = _fmtSize(sent) + ' / ' + _fmtSize(total);
+  if (rate > 0 && pct < 100) {
+    m += ' <span class="dim">·</span> ' + _fmtSize(rate) + '/s';
+    if (eta > 0) m += ' <span class="dim">· ~' + _fmtTime(eta) + '</span>';
+  }
+  a.el.querySelector('.act-meta').innerHTML = m;
+}
+
+function actFinish(id, ok) {
+  var a = _acts[id]; if (!a) return;
+  a.el.classList.add('done');
+  a.el.querySelector('.act-pct').textContent = ok === false ? '✕' : '✓';
+  a.el.querySelector('.act-bar-fill').style.width = '100%';
+  setTimeout(function() {
+    try { a.el.remove(); } catch (e) {}
+    delete _acts[id];
+    _hidePanelIfEmpty();
+  }, 3500);
+}
+
+function activityPoll(tid, name) {
+  if (!_acts[tid]) actStart(tid, name, 'dn');
+  var consecutiveUnknown = 0;
+  var gotAny = false;
+  var int = setInterval(async function() {
+    try {
+      var res = await fetch('/api/progress?tid=' + encodeURIComponent(tid));
+      if (!res.ok) { consecutiveUnknown++; }
+      else {
+        var p = await res.json();
+        if (p && p.unknown) {
+          consecutiveUnknown++;
+        } else if (p && typeof p.total !== 'undefined') {
+          consecutiveUnknown = 0;
+          gotAny = true;
+          actUpdate(tid, p.sent || 0, p.total || 0, p.rate);
+          if (p.done) {
+            clearInterval(int);
+            actFinish(tid, true);
+            return;
+          }
+        }
+      }
+      // If we never saw the tid after ~15s, the browser is probably using
+      // cached data or the server never got the request. Give up quietly.
+      if (!gotAny && consecutiveUnknown > 30) {
+        clearInterval(int);
+        actFinish(tid, false);
+      }
+    } catch (e) {}
+  }, 500);
+}
+
 async function uploadFiles(fls) {
-  var prog = document.getElementById('upload-progress');
-  var bar = document.getElementById('up-bar');
-  var txt = document.getElementById('up-text');
-  prog.style.display = 'block';
   for (var i = 0; i < fls.length; i++) {
     var f = fls[i];
-    txt.textContent = 'Enviando ' + (i+1) + '/' + fls.length + ': ' + f.name;
-    bar.style.width = '0%';
+    var id = 'up_' + Date.now() + '_' + i;
+    actStart(id, f.name, 'up');
     await new Promise(function(resolve) {
       var xhr = new XMLHttpRequest();
       xhr.open('POST', '/upload');
       xhr.upload.onprogress = function(e) {
-        if (e.lengthComputable) {
-          var pct = Math.round(e.loaded / e.total * 100);
-          bar.style.width = pct + '%';
-          txt.textContent = 'Enviando ' + (i+1) + '/' + fls.length + ': ' + f.name + ' (' + pct + '%)';
-        }
+        if (e.lengthComputable) actUpdate(id, e.loaded, e.total);
       };
-      xhr.onload = function() { resolve(); };
-      xhr.onerror = function() { txt.textContent = 'Erro ao enviar ' + f.name; resolve(); };
+      xhr.onload = function() { actUpdate(id, f.size, f.size); actFinish(id, true); resolve(); };
+      xhr.onerror = function() { actFinish(id, false); resolve(); };
       var form = new FormData();
       form.append('file', f);
       xhr.send(form);
     });
   }
-  bar.style.width = '100%';
-  txt.textContent = '\\u2705 ' + fls.length + ' arquivo(s) enviado(s)!';
-  setTimeout(function() { prog.style.display = 'none'; }, 4000);
+  // Reset input so the same file can be picked again.
+  var inp = document.getElementById('file-input');
+  if (inp) inp.value = '';
 }
 
 var SELECTED = {};
@@ -565,6 +878,11 @@ function toggleAll() {
   updateSelectionUI();
 }
 
+function _newTid() {
+  if (window.crypto && crypto.randomUUID) return 't_' + crypto.randomUUID();
+  return 't_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 10);
+}
+
 function downloadSelected(e) {
   e.preventDefault();
   var picks = [];
@@ -572,51 +890,131 @@ function downloadSelected(e) {
     if (SELECTED[FILE_LIST[i].rel]) picks.push(FILE_LIST[i]);
   }
   if (picks.length === 0) return;
-  var prog = document.getElementById('dl-progress');
-  var bar = document.getElementById('dl-bar');
-  var txt = document.getElementById('dl-text');
+  var tid = _newTid();
   if (picks.length === 1) {
-    // Single file: native download link (keeps filename + lets iOS show
-    // the usual "Download" prompt at the bottom of Safari).
+    // Single: route through /dl/ with tid. Native download UI still fires.
     var f = picks[0];
+    var url = '/dl/' + encodeURIComponent(f.rel) + '?tid=' + encodeURIComponent(tid);
     var a = document.createElement('a');
-    a.href = '/dl/' + encodeURIComponent(f.rel);
-    a.download = f.name;
+    a.href = url; a.download = f.name; a.setAttribute('data-no-track', '1');
     document.body.appendChild(a); a.click(); document.body.removeChild(a);
-    prog.style.display = 'block';
-    bar.style.width = '100%';
-    txt.textContent = '\\u2B07 Baixando ' + f.name;
-    setTimeout(function(){ prog.style.display='none'; }, 3000);
+    activityPoll(tid, f.name);
     return;
   }
-  // Multi-file: synchronous form POST in the user-gesture. Server streams
-  // back a ZIP with Content-Disposition: attachment, so Safari triggers
-  // a single download instead of fighting us over N separate clicks.
+  // Multi-file ZIP
   var zipName = 'oceanshare-' + picks.length + '-arquivos.zip';
-  prog.style.display = 'block';
-  bar.style.width = '40%';
-  txt.textContent = '\\u23F3 Preparando ZIP (' + picks.length + ' arquivos)... aguarde';
   var form = document.createElement('form');
   form.method = 'POST';
   form.action = '/zip';
   form.acceptCharset = 'UTF-8';
   form.enctype = 'application/x-www-form-urlencoded';
-  var fi = document.createElement('input');
-  fi.type = 'hidden'; fi.name = 'files';
-  fi.value = JSON.stringify(picks.map(function(p){ return p.rel; }));
-  form.appendChild(fi);
-  var fn = document.createElement('input');
-  fn.type = 'hidden'; fn.name = 'name'; fn.value = zipName;
-  form.appendChild(fn);
+  function hidden(name, val) { var i=document.createElement('input'); i.type='hidden'; i.name=name; i.value=val; form.appendChild(i); }
+  hidden('files', JSON.stringify(picks.map(function(p){ return p.rel; })));
+  hidden('name', zipName);
+  hidden('tid', tid);
   document.body.appendChild(form);
   form.submit();
-  setTimeout(function(){
-    try { document.body.removeChild(form); } catch(e) {}
-    bar.style.width = '100%';
-    txt.textContent = '\\u2B07 Baixando ' + zipName;
-    setTimeout(function(){ prog.style.display='none'; }, 5000);
-  }, 500);
+  setTimeout(function(){ try { document.body.removeChild(form); } catch(e) {} }, 500);
+  activityPoll(tid, zipName);
 }
+
+// Intercept /dl/ anchors with a download attribute (per-card "Baixar",
+// lightbox "Baixar original", etc). We mutate the anchor's href in place
+// with a fresh ?tid=... and let the native click proceed — this keeps the
+// download inside its original user-gesture context. Dispatching a
+// programmatically-built anchor.click() breaks that context on Chrome
+// Android and fires a "File can't be downloaded securely" warning.
+//
+// Exception: anchors tagged with data-orig="1" (the "baixar RAW original"
+// link for camera files). Chrome Android flags direct HTTP downloads of
+// .ARW/.CR2/.NEF as "potentially dangerous" regardless of URL scheme —
+// even blob: URLs still show "File can't be downloaded securely" because
+// the check also looks at the destination filename extension.
+//
+// Workaround: fetch → Blob → navigator.share. On iPhone this opens Files
+// / Photos, on Android it opens the share sheet (Drive, Files, Dropbox,
+// …) — both skip the insecure-download warning and actually land the
+// file where the user wants it. Fallback to blob-URL download for old
+// browsers that don't do File-sharing yet.
+async function downloadRawOriginal(url, name) {
+  var id = _newTid();
+  actStart(id, name, 'dn');
+  try {
+    var resp = await fetch(url);
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    var total = parseInt(resp.headers.get('Content-Length') || '0', 10);
+    var chunks = []; var got = 0;
+    var reader = resp.body && resp.body.getReader ? resp.body.getReader() : null;
+    if (reader) {
+      while (true) {
+        var r = await reader.read();
+        if (r.done) break;
+        chunks.push(r.value); got += r.value.length;
+        actUpdate(id, got, total);
+      }
+    } else {
+      var blob0 = await resp.blob();
+      chunks = [blob0]; got = blob0.size;
+      actUpdate(id, got, total || got);
+    }
+    var mime = resp.headers.get('Content-Type') || 'application/octet-stream';
+    var blob = new Blob(chunks, {type: mime});
+
+    // Try Web Share API with files first (iOS Safari 15+, Chrome 89+).
+    if (navigator.canShare) {
+      try {
+        var file = new File([blob], name, {type: mime});
+        if (navigator.canShare({files: [file]})) {
+          await navigator.share({files: [file]});
+          actFinish(id, true);
+          return;
+        }
+      } catch (err) {
+        if (err && err.name === 'AbortError') {
+          // User dismissed the share sheet — not a failure.
+          actFinish(id, true);
+          return;
+        }
+        // Any other share error → fall through to blob-URL download.
+      }
+    }
+
+    // Fallback: blob-URL download. On Chrome Android this may still warn,
+    // but the user can tap "Keep anyway". Most desktop browsers are fine.
+    var blobUrl = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = blobUrl; a.download = name; a.style.display = 'none';
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(function(){ URL.revokeObjectURL(blobUrl); }, 60000);
+    actFinish(id, true);
+  } catch (e) {
+    console.error('raw dl failed', e);
+    actFinish(id, false);
+  }
+}
+
+document.addEventListener('click', function(e) {
+  var a = e.target.closest('a[href]');
+  if (!a) return;
+  if (!a.hasAttribute('download')) return;
+  var href = a.getAttribute('href') || '';
+  if (href.indexOf('/dl/') !== 0 && href.indexOf('/dl_jpg/') !== 0) return;
+
+  if (a.getAttribute('data-orig') === '1') {
+    // RAW original: fetch + navigator.share (or blob fallback).
+    e.preventDefault();
+    downloadRawOriginal(href, a.getAttribute('download') || 'download');
+    return;
+  }
+
+  // Normal path: mutate href in place, let native download fire.
+  var clean = href.replace(/([?&])tid=[^&]*(&|$)/, function(_, pre, post){return post?pre:'';});
+  clean = clean.replace(/[?&]$/, '');
+  var sep = clean.indexOf('?') >= 0 ? '&' : '?';
+  var tid = _newTid();
+  a.setAttribute('href', clean + sep + 'tid=' + encodeURIComponent(tid));
+  activityPoll(tid, a.getAttribute('download') || 'download');
+});
 
 for (var i = 0; i < FILE_LIST.length; i++) SELECTED[FILE_LIST[i].rel] = false;
 updateSelectionUI();
@@ -719,9 +1117,17 @@ async function saveToPhotos(btn){
 
 // ── Lightbox: tap image thumb -> open full-res preview ──
 var _lbCur = null;
+var _RAW_EXTS = ['arw','nef','cr2','cr3','raf','rw2','orf','dng','raw'];
+function _extOf(name) {
+  var i = name.lastIndexOf('.');
+  return i >= 0 ? name.slice(i + 1).toLowerCase() : '';
+}
+function _isRaw(name) { return _RAW_EXTS.indexOf(_extOf(name)) >= 0; }
 
 function openLightbox(rel, enc, name) {
-  _lbCur = {rel: rel, enc: enc, name: name};
+  var raw = _isRaw(name);
+  var stem = name.replace(/\\.[^.]+$/, '');
+  _lbCur = {rel: rel, enc: enc, name: name, isRaw: raw, jpgName: stem + '.jpg'};
   var lb = document.getElementById('lightbox');
   var img = document.getElementById('lb-img');
   var spin = document.getElementById('lb-spinner');
@@ -729,8 +1135,11 @@ function openLightbox(rel, enc, name) {
   var dl = document.getElementById('lb-dl');
   var save = document.getElementById('lb-save');
   title.textContent = name;
+  // For RAW files the "download original" button stays pointed at the
+  // raw file but gets a clearer label so users know what they're grabbing.
   dl.href = '/dl/' + enc;
   dl.setAttribute('download', name);
+  dl.textContent = raw ? '\\u2B07 Baixar .' + _extOf(name).toUpperCase() : '\\u2B07 Baixar original';
   // Hide "Salvar em Fotos" if Web Share API is unavailable.
   save.style.display = document.body.classList.contains('can-share') ? '' : 'none';
   img.classList.remove('ready');
@@ -767,10 +1176,13 @@ function closeLightbox() {
 
 function lbSave() {
   if (!_lbCur) return;
-  // Reuse the Share-API flow from per-card buttons.
+  // Reuse the Share-API flow. For RAW files we route to the JPEG endpoint
+  // so iPhone Photos / Android gallery receive a viewable image.
   var btn = document.getElementById('lb-save');
-  btn.setAttribute('data-url', '/dl/' + _lbCur.enc);
-  btn.setAttribute('data-name', _lbCur.name);
+  var url = (_lbCur.isRaw ? '/dl_jpg/' : '/dl/') + _lbCur.enc;
+  var name = _lbCur.isRaw ? _lbCur.jpgName : _lbCur.name;
+  btn.setAttribute('data-url', url);
+  btn.setAttribute('data-name', name);
   btn.setAttribute('data-type', 'image');
   saveToPhotos(btn);
 }
@@ -827,9 +1239,31 @@ def build_download_page(subpath=""):
         else:
             preview = f'<div class="preview no-img">{icon}</div>'
         name_attr = fi["name"].replace('"', '&quot;')
+        ext_fi = os.path.splitext(fi["name"])[1].lower()
+        is_raw = ext_fi in RAW_EXTS
+        # For RAW files the "Baixar" button grabs a rendered JPEG so Android /
+        # iOS galleries can display it. Photographers still get the original
+        # via the small "original .ARW" link below the action row.
+        jpg_name = os.path.splitext(fi["name"])[0] + ".jpg"
+        jpg_name_attr = jpg_name.replace('"', '&quot;')
+        if is_raw:
+            dl_href = f'/dl_jpg/{enc}'
+            dl_dl = jpg_name_attr
+            dl_label = '⬇ Baixar JPEG'
+            raw_label = ext_fi.lstrip('.').upper()
+            raw_link = f'<div class="raw-orig"><a href="/dl/{enc}" download="{name_attr}" data-orig="1">baixar {raw_label} original</a></div>'
+        else:
+            dl_href = f'/dl/{enc}'
+            dl_dl = name_attr
+            dl_label = '⬇ Baixar'
+            raw_link = ''
         share_btn = ''
         if fi["type"] in ("video", "image"):
-            share_btn = f'<button class="save-photos" data-url="/dl/{enc}" data-name="{name_attr}" data-type="{fi["type"]}" onclick="event.preventDefault();event.stopPropagation();saveToPhotos(this)">📸 Salvar em Fotos</button>'
+            # Same RAW→JPEG swap for "Salvar em Fotos" so the iPhone Photos
+            # app gets something it can display.
+            share_url = f'/dl_jpg/{enc}' if is_raw else f'/dl/{enc}'
+            share_name = jpg_name_attr if is_raw else name_attr
+            share_btn = f'<button class="save-photos" data-url="{share_url}" data-name="{share_name}" data-type="{fi["type"]}" onclick="event.preventDefault();event.stopPropagation();saveToPhotos(this)">📸 Salvar em Fotos</button>'
         cards += f'''<div class="card{hidden_cls}" data-rel="{rel_attr}" data-idx="{idx}">
             <label class="select-chk" onclick="event.stopPropagation()"><input type="checkbox" class="file-chk" data-rel="{rel_attr}" onchange="onItemToggle(this)"><span class="chk-box"></span></label>
             {preview}
@@ -837,9 +1271,10 @@ def build_download_page(subpath=""):
               <span class="fname">{fi["name"]}</span>
               <span class="meta"><span class="fdate">{fi["date"]}</span><span class="fsize">{fi["size"]}</span></span>
               <div class="card-actions">
-                <a class="dl-btn" href="/dl/{enc}" download="{name_attr}">⬇ Baixar</a>
+                <a class="dl-btn" href="{dl_href}" download="{dl_dl}">{dl_label}</a>
                 {share_btn}
               </div>
+              {raw_link}
             </div></div>'''
 
     if len(files) > PAGE_SIZE:
@@ -983,6 +1418,9 @@ font-size:.6em;color:#fff;padding-left:3px}}
 .fsize{{color:#94a3b8;font-size:.78em}}
 .fdate{{color:#64748b;font-size:.75em}}
 .card-actions{{display:flex;gap:8px;margin-top:6px;flex-wrap:wrap}}
+.raw-orig{{margin-top:6px;font-size:.72em;text-align:center}}
+.raw-orig a{{color:var(--accent);opacity:.6;text-decoration:none;letter-spacing:.2px}}
+.raw-orig a:active{{opacity:1;text-decoration:underline}}
 .dl-btn{{flex:1;min-width:110px;text-align:center;background:rgba(255,255,255,.05);
 color:#e2e8f0;padding:10px 14px;border-radius:10px;font-size:.82em;font-weight:600;
 border:1px solid rgba(255,255,255,.1);text-decoration:none;cursor:pointer;
@@ -1014,29 +1452,57 @@ color:var(--accent);padding:14px;border-radius:14px;font-size:.92em;font-weight:
 text-decoration:none;border:1px solid rgba(56,189,248,.15);margin-bottom:14px;transition:.15s}}
 .dl-all:active{{background:rgba(56,189,248,.12);transform:scale(.98)}}
 
-/* progress bars */
-.dl-progress,.upload-progress{{display:none;text-align:center;margin-top:8px}}
-.dl-progress .prog-text,.upload-progress .prog-text{{font-size:.82em;margin-bottom:4px}}
-.prog-bar{{width:100%;height:4px;background:rgba(255,255,255,.06);border-radius:2px;margin-top:6px;overflow:hidden}}
-.prog-fill-dl{{height:100%;background:linear-gradient(90deg,var(--accent),#818cf8);border-radius:2px;transition:width .3s;width:0%}}
-.prog-fill-up{{height:100%;background:linear-gradient(90deg,var(--purple),#c084fc);border-radius:2px;transition:width .3s;width:0%}}
+/* FAB: upload button in bottom-right */
+.fab-upload{{position:fixed;right:20px;bottom:calc(env(safe-area-inset-bottom) + 20px);
+width:58px;height:58px;border-radius:50%;border:none;cursor:pointer;z-index:120;
+background:linear-gradient(135deg,#8b5cf6,#7c3aed);color:white;
+box-shadow:0 8px 24px rgba(139,92,246,.45),0 2px 6px rgba(0,0,0,.2);
+display:flex;align-items:center;justify-content:center;
+-webkit-tap-highlight-color:transparent;transition:transform .12s,box-shadow .12s}}
+.fab-upload:active{{transform:scale(.92);box-shadow:0 4px 12px rgba(139,92,246,.35)}}
+.fab-upload .fab-ic{{font-size:1.35em;line-height:1}}
 
-/* upload bar */
-.upload-bar{{position:fixed;bottom:0;left:0;right:0;
-padding:12px 16px calc(env(safe-area-inset-bottom) + 12px);
-background:rgba(8,12,24,.92);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
-border-top:1px solid rgba(255,255,255,.06);display:flex;flex-direction:column;align-items:center;z-index:100}}
-.upload-btn{{background:linear-gradient(135deg,#8b5cf6,#7c3aed);color:white;
-padding:14px 28px;border-radius:14px;font-size:.95em;font-weight:700;border:none;
-cursor:pointer;width:100%;max-width:500px;box-shadow:0 4px 16px rgba(139,92,246,.3);transition:.15s}}
-.upload-btn:active{{transform:scale(.97);box-shadow:0 2px 8px rgba(139,92,246,.4)}}
+/* Activity panel: slide-up from bottom, shows uploads + downloads in flight */
+.activity-panel{{position:fixed;left:12px;right:12px;bottom:calc(env(safe-area-inset-bottom) + 90px);
+background:rgba(8,12,24,.88);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
+border:1px solid rgba(255,255,255,.08);border-radius:16px;z-index:110;
+max-height:50vh;overflow:hidden;display:flex;flex-direction:column;
+box-shadow:0 12px 36px rgba(0,0,0,.45);
+transform:translateY(0);transition:transform .25s ease,opacity .2s}}
+.activity-panel.hidden{{transform:translateY(calc(100% + 24px));opacity:0;pointer-events:none}}
+.activity-panel.minimized{{max-height:44px}}
+.activity-panel.minimized .act-items{{display:none}}
+.act-head{{display:flex;align-items:center;justify-content:space-between;
+padding:10px 14px;border-bottom:1px solid rgba(255,255,255,.05)}}
+.act-head-title{{font-size:.78em;font-weight:700;color:var(--text-1,#e2e8f0)}}
+.act-head-min{{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.08);
+color:#e2e8f0;border-radius:8px;width:28px;height:28px;font-size:.95em;font-weight:800;
+line-height:1;cursor:pointer;padding:0}}
+.act-head-min:active{{transform:scale(.92)}}
+.act-items{{padding:8px 12px 10px;overflow-y:auto;-webkit-overflow-scrolling:touch}}
+.act-item{{padding:10px 0;border-bottom:1px solid rgba(255,255,255,.04)}}
+.act-item:last-child{{border-bottom:none}}
+.act-row{{display:flex;align-items:center;gap:8px;margin-bottom:4px}}
+.act-ic{{font-size:1em;line-height:1;flex-shrink:0}}
+.act-name{{flex:1;min-width:0;font-size:.82em;font-weight:600;
+overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+.act-pct{{font-size:.78em;font-weight:700;color:var(--accent);flex-shrink:0}}
+.act-item.up .act-pct{{color:var(--purple)}}
+.act-item.done .act-pct{{color:var(--green)}}
+.act-bar{{width:100%;height:4px;background:rgba(255,255,255,.08);border-radius:2px;overflow:hidden}}
+.act-bar-fill{{height:100%;border-radius:2px;transition:width .25s ease;width:0%}}
+.act-item.dn .act-bar-fill{{background:linear-gradient(90deg,var(--accent),#818cf8)}}
+.act-item.up .act-bar-fill{{background:linear-gradient(90deg,var(--purple),#c084fc)}}
+.act-item.done .act-bar-fill{{background:var(--green)}}
+.act-meta{{font-size:.68em;color:#94a3b8;margin-top:3px;line-height:1.3}}
+.act-meta .dim{{color:#64748b}}
 </style></head><body><div class="c">
 <div class="header">
   <div class="logo"><div class="logo-icon"><img src="/app-icon" alt=""></div><h1>{title}</h1></div>
   <p class="sub">{subtitle}</p>
   <div class="count-pill">📂 {total} item{"s" if total!=1 else ""}</div>
 </div>
-{'''<div class="sel-bar"><div class="sel-count"><span id="sel-num">0</span> de ''' + str(len(files)) + ''' selecionado(s)</div><button class="sel-btn" id="btn-all" onclick="toggleAll()">Marcar tudo</button><button class="sel-btn primary" id="btn-dl-sel" onclick="downloadSelected(event)" disabled>⬇ Baixar</button></div><div class="dl-progress" id="dl-progress"><span class="prog-text" id="dl-text"></span><div class="prog-bar"><div class="prog-fill-dl" id="dl-bar"></div></div></div>''' if files else ''}
+{'''<div class="sel-bar"><div class="sel-count"><span id="sel-num">0</span> de ''' + str(len(files)) + ''' selecionado(s)</div><button class="sel-btn" id="btn-all" onclick="toggleAll()">Marcar tudo</button><button class="sel-btn primary" id="btn-dl-sel" onclick="downloadSelected(event)" disabled>⬇ Baixar</button></div>''' if files else ''}
 {cards if cards else '<p class="empty">Nenhum arquivo encontrado.</p>'}
 </div>
 <div id="lightbox" onclick="if(event.target.id==='lightbox')closeLightbox()">
@@ -1053,13 +1519,20 @@ cursor:pointer;width:100%;max-width:500px;box-shadow:0 4px 16px rgba(139,92,246,
     <button class="lb-btn primary" id="lb-save" onclick="lbSave()">📸 Salvar em Fotos</button>
   </div>
 </div>
-<div class="upload-bar">
-  <button class="upload-btn" onclick="document.getElementById('file-input').click()">📤 Enviar arquivo para o Mac</button>
-  <input type="file" id="file-input" multiple accept="*/*" style="display:none" onchange="uploadFiles(this.files)">
-  <div class="upload-progress" id="upload-progress">
-    <span class="prog-text" id="up-text"></span>
-    <div class="prog-bar"><div class="prog-fill-up" id="up-bar"></div></div>
+
+<!-- FAB: enviar arquivo pro Mac -->
+<button class="fab-upload" onclick="document.getElementById('file-input').click()" aria-label="Enviar para o Mac" title="Enviar para o Mac">
+  <span class="fab-ic">📤</span>
+</button>
+<input type="file" id="file-input" multiple accept="*/*" style="display:none" onchange="uploadFiles(this.files)">
+
+<!-- Activity panel: upload e download progress unificados -->
+<div class="activity-panel hidden" id="activity-panel">
+  <div class="act-head">
+    <span class="act-head-title">Atividade</span>
+    <button class="act-head-min" onclick="toggleActivityPanel()" aria-label="Minimizar">—</button>
   </div>
+  <div class="act-items" id="act-items"></div>
 </div>
 """ + _build_download_script(files)
 
@@ -1120,9 +1593,12 @@ class UnifiedHandler(http.server.BaseHTTPRequestHandler):
             self._api_transfers()
         elif is_admin and self.path == '/api/received':
             self._api_received()
+        elif self.path.startswith('/api/progress'):
+            # Public: mobile polls this to render its own progress bar.
+            self._api_progress()
         elif is_admin and self.path.startswith('/api/'):
             pass  # POST only
-        elif not is_admin or self.path.startswith(('/browse', '/dl/', '/thumb/', '/preview/')):
+        elif not is_admin or self.path.startswith(('/browse', '/dl/', '/dl_jpg/', '/thumb/', '/preview/')):
             if not state.serving and not is_admin:
                 self._send_html("<h1>OceanShare ainda não está ligado</h1>"); return
             if self.path in ('/', ''):
@@ -1141,6 +1617,8 @@ class UnifiedHandler(http.server.BaseHTTPRequestHandler):
                 self._serve_preview(self.path[9:])
             elif self.path.startswith('/dl/'):
                 self._serve_file(self.path[4:])
+            elif self.path.startswith('/dl_jpg/'):
+                self._serve_jpeg(self.path[8:])
             elif self.path == '/favicon.ico':
                 self.send_response(204); self.end_headers()
             else:
@@ -1241,18 +1719,21 @@ class UnifiedHandler(http.server.BaseHTTPRequestHandler):
         ct = self.headers.get('Content-Type', '')
         rels = []
         zip_name = "oceanshare.zip"
+        tid = None
         try:
             if 'application/json' in ct:
                 data = json.loads(body.decode('utf-8'))
                 rels = data.get('files', []) or []
                 zip_name = data.get('name') or zip_name
+                tid = data.get('tid') or None
             else:
-                # form-urlencoded: files=<json-array>&name=...
+                # form-urlencoded: files=<json-array>&name=...&tid=...
                 form = urllib.parse.parse_qs(body.decode('utf-8'))
                 files_field = (form.get('files') or [''])[0]
                 if files_field:
                     rels = json.loads(files_field)
                 zip_name = (form.get('name') or [zip_name])[0]
+                tid = (form.get('tid') or [None])[0]
         except Exception:
             self._send_json({"ok": False, "error": "Payload inválido"})
             return
@@ -1289,14 +1770,21 @@ class UnifiedHandler(http.server.BaseHTTPRequestHandler):
             safe_name = zip_name.replace('"', '').replace('\\', '')[:120] or "oceanshare.zip"
             if not safe_name.lower().endswith('.zip'):
                 safe_name += '.zip'
-            transfer = state.add_transfer(safe_name, fmt_size(sum(os.path.getsize(fp) for fp, _ in safe)), "download")
+            total_bytes = sum(os.path.getsize(fp) for fp, _ in safe)
+            # If every file sits inside the same subfolder, surface it in the
+            # transfer log (e.g. "andre-fotos"). Otherwise leave blank — a ZIP
+            # spanning multiple folders has no single parent to display.
+            parents = {os.path.dirname(rel).replace(os.sep, "/") for rel in rels}
+            parent = next(iter(parents)) if len(parents) == 1 else ""
+            transfer = state.add_transfer(safe_name, fmt_size(total_bytes), "download", path=parent)
+            state.progress_start(tid, safe_name, total_bytes)
             self.send_response(200)
             self.send_header('Content-Type', 'application/zip')
             self.send_header('Content-Disposition', f'attachment; filename="{safe_name}"')
             self.send_header('Connection', 'close')
             self.end_headers()
             stream = _HttpChunkWriter(self.wfile)
-            total = sum(os.path.getsize(fp) for fp, _ in safe) or 1
+            total = total_bytes or 1
             sent_bytes = 0
             # ZIP_STORED: video files are already compressed; skip the CPU cost.
             with zipfile.ZipFile(stream, mode='w', compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
@@ -1316,12 +1804,14 @@ class UnifiedHandler(http.server.BaseHTTPRequestHandler):
                                 sent_bytes += len(chunk)
                                 if transfer:
                                     transfer["progress"] = min(99, int(sent_bytes * 100 / total))
+                                state.progress_update(tid, sent_bytes)
                     except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                         return
                     except Exception:
                         continue
             if transfer:
                 state.finish_transfer(transfer)
+            state.progress_finish(tid)
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             return
 
@@ -1401,6 +1891,21 @@ class UnifiedHandler(http.server.BaseHTTPRequestHandler):
         with state._lock:
             self._send_json({"transfers": list(state.transfers)})
 
+    def _api_progress(self):
+        qs = urllib.parse.parse_qs(self.path.split('?', 1)[1] if '?' in self.path else '')
+        tid = (qs.get('tid') or [''])[0]
+        e = state.get_progress(tid) if tid else None
+        if not e:
+            self._send_json({"unknown": True}); return
+        elapsed = max(0.001, time.time() - e["start_ts"])
+        sent = e.get("sent", 0); total = e.get("total", 0) or 0
+        rate = sent / elapsed
+        eta = (total - sent) / rate if rate > 0 and total > sent else 0
+        self._send_json({
+            "name": e["name"], "sent": sent, "total": total,
+            "done": bool(e.get("done")), "rate": rate, "eta": eta,
+        })
+
     def _api_received(self):
         received = []
         if state.folder:
@@ -1415,6 +1920,13 @@ class UnifiedHandler(http.server.BaseHTTPRequestHandler):
         self._send_json({"received": received})
 
     def _serve_file(self, rel_encoded):
+        # Strip query string first (tid= is our progress-tracking token).
+        tid = None
+        q = rel_encoded.find('?')
+        if q >= 0:
+            qs = urllib.parse.parse_qs(rel_encoded[q+1:])
+            tid = (qs.get('tid') or [None])[0]
+            rel_encoded = rel_encoded[:q]
         rel = urllib.parse.unquote(rel_encoded)
         fp = os.path.realpath(os.path.join(state.folder, rel))
         if not fp.startswith(os.path.realpath(state.folder)): self.send_error(403); return
@@ -1476,13 +1988,16 @@ class UnifiedHandler(http.server.BaseHTTPRequestHandler):
         self.send_header('Accept-Ranges', 'bytes')
         self.send_header('Content-Disposition', f'attachment; filename="{name}"')
         self.end_headers()
+        parent = os.path.dirname(rel).replace(os.sep, "/")
         if not is_admin:
-            transfer = state.add_transfer(name, fmt_size(sz), "download")
-        self._stream_file(fp, 0, sz, transfer)
+            transfer = state.add_transfer(name, fmt_size(sz), "download", path=parent)
+        state.progress_start(tid, name, sz)
+        self._stream_file(fp, 0, sz, transfer, tid=tid)
         if transfer:
             state.finish_transfer(transfer)
+        state.progress_finish(tid)
 
-    def _stream_file(self, fp, offset, length, transfer=None):
+    def _stream_file(self, fp, offset, length, transfer=None, tid=None):
         """Zero-copy send via os.sendfile when available, fallback to read/write.
 
         Falls back cleanly on BrokenPipe (client closed early — common with
@@ -1518,6 +2033,7 @@ class UnifiedHandler(http.server.BaseHTTPRequestHandler):
                     cur += n; remaining -= n; sent += n
                     if transfer and length > 0:
                         transfer["progress"] = min(100, int(sent * 100 / length))
+                    if tid: state.progress_update(tid, sent)
                 return
             # Fallback: buffered copy
             f.seek(offset)
@@ -1530,6 +2046,7 @@ class UnifiedHandler(http.server.BaseHTTPRequestHandler):
                 remaining -= len(chunk); sent += len(chunk)
                 if transfer and length > 0:
                     transfer["progress"] = min(100, int(sent * 100 / length))
+                if tid: state.progress_update(tid, sent)
         finally:
             try: f.close()
             except Exception: pass
@@ -1545,6 +2062,60 @@ class UnifiedHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         with open(ICON_PATH, 'rb') as f:
             self.wfile.write(f.read())
+
+    def _serve_jpeg(self, rel_encoded):
+        """Gallery-friendly JPEG rendering of a RAW file. Same URL shape as
+        /dl/ but renders via sips and swaps the filename extension to .jpg
+        so Android/iOS galleries can thumbnail it.
+
+        For non-RAW formats we fall through to the plain /dl/ handler — no
+        point re-encoding a JPG as a smaller JPG."""
+        tid = None
+        q = rel_encoded.find('?')
+        if q >= 0:
+            qs = urllib.parse.parse_qs(rel_encoded[q+1:])
+            tid = (qs.get('tid') or [None])[0]
+            rel_encoded = rel_encoded[:q]
+        rel = urllib.parse.unquote(rel_encoded)
+        fp = os.path.realpath(os.path.join(state.folder, rel))
+        if not fp.startswith(os.path.realpath(state.folder)):
+            self.send_error(403); return
+        if not os.path.isfile(fp):
+            self.send_error(404); return
+        ext = os.path.splitext(fp)[1].lower()
+        if ext not in RAW_EXTS:
+            # Not RAW — just serve the original file (which is already a
+            # gallery-viewable format). Re-append tid so progress polling
+            # still works through the /dl_jpg/ entry point.
+            suffix = rel_encoded + (('?tid=' + urllib.parse.quote(tid)) if tid else '')
+            self._serve_file(suffix); return
+
+        jpg = get_jpeg_path(rel)
+        if not jpg:
+            self.send_error(500); return
+        if not os.path.exists(jpg):
+            if not generate_jpeg(fp, jpg):
+                self.send_error(500); return
+        sz = os.path.getsize(jpg)
+        stem, _ = os.path.splitext(os.path.basename(fp))
+        dl_name = stem + '.jpg'
+        parent = os.path.dirname(rel).replace(os.sep, "/")
+        client_ip = self.client_address[0]
+        is_admin = client_ip in ('127.0.0.1', '::1')
+        transfer = None
+        if not is_admin:
+            transfer = state.add_transfer(dl_name, fmt_size(sz), "download", path=parent)
+        state.progress_start(tid, dl_name, sz)
+        self.send_response(200)
+        self.send_header('Content-Type', 'image/jpeg')
+        self.send_header('Content-Length', str(sz))
+        self.send_header('Accept-Ranges', 'bytes')
+        self.send_header('Content-Disposition', f'attachment; filename="{dl_name}"')
+        self.end_headers()
+        self._stream_file(jpg, 0, sz, transfer, tid=tid)
+        if transfer:
+            state.finish_transfer(transfer)
+        state.progress_finish(tid)
 
     def _serve_preview(self, rel_encoded):
         """Medium-res preview for lightbox tap. Serves the original for
@@ -1695,6 +2266,7 @@ border:1px solid rgba(255,255,255,.06);border-radius:10px;padding:8px 10px;line-
 .tip-box li{margin-bottom:4px}
 .tip-box b{color:var(--text-1)}
 
+
 /* steps (offline) */
 .steps-mini{display:flex;flex-direction:column;gap:8px;margin-top:auto}
 .step-m{display:flex;align-items:center;gap:10px;text-align:left}
@@ -1768,6 +2340,10 @@ border:1px solid rgba(255,255,255,.04);transition:.15s}
 .t-icon{font-size:1.1em;flex-shrink:0}
 .t-info{flex:1;min-width:0}
 .t-name{font-size:.74em;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.t-folder{font-size:.62em;color:var(--text-3);margin-top:1px;display:flex;align-items:center;gap:3px;
+overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.t-folder .tf-ic{opacity:.6}
+.t-folder .tf-path{color:var(--accent);opacity:.8;font-weight:500}
 .t-detail{font-size:.62em;color:var(--text-3);display:flex;align-items:center;gap:6px;margin-top:2px}
 .t-bar{width:50px;height:3px;background:rgba(255,255,255,.08);border-radius:2px;overflow:hidden}
 .t-bar-fill{height:100%;border-radius:2px;transition:width .3s}
@@ -1797,7 +2373,7 @@ border:1px solid rgba(255,255,255,.04);transition:.15s}
   <div class="left glass">
     <div class="brand">
       <div class="brand-icon"><img src="/app-icon" alt=""></div>
-      <div><h1>OceanShare<span class="ver">v5</span></h1></div>
+      <div><h1>OceanShare<span class="ver">v6</span></h1></div>
     </div>
     <div id="status" class="pill off"><span class="dot"></span><span id="stxt">Desligado</span></div>
     <div class="folder-card" id="folder-card" onclick="chooseFolder()">
@@ -1862,6 +2438,7 @@ border:1px solid rgba(255,255,255,.04);transition:.15s}
     </div>
   </div>
 </div>
+
 <script>
 var currentPath='';
 var currentTab='transfers';
@@ -1953,6 +2530,7 @@ function swapUrl(idx){
   renderAltIps(idx);
 }
 
+
 function retryFailedThumbs(){
   var imgs=document.querySelectorAll('.file-thumb img[style*="display: none"],.file-thumb img[style*="display:none"]');
   imgs.forEach(function(img){
@@ -2016,6 +2594,7 @@ function startPolling(){
 }
 function stopPolling(){if(pollTimer){clearInterval(pollTimer);pollTimer=null;}}
 
+function escapeHtml(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];});}
 function renderTransfers(list){
   document.getElementById('badge-transfers').textContent=list.length;
   var c=document.getElementById('tab-content-transfers');
@@ -2027,7 +2606,10 @@ function renderTransfers(list){
     var icon=isUp?'📥':'📤';
     var cls=isUp?'ul':'dl';
     var sDone=t.progress>=100;
-    h+='<div class="transfer-item"><span class="t-icon">'+icon+'</span><div class="t-info"><div class="t-name">'+t.name+'</div><div class="t-detail"><div class="t-bar"><div class="t-bar-fill '+cls+'" style="width:'+t.progress+'%"></div></div><span>'+t.size+'</span></div></div><span class="t-status '+(sDone?'done':'active')+'">'+(sDone?'✓':''+t.progress+'%')+'</span></div>';
+    // Only show folder row when the file sits below the shared root.
+    // Root-level files and multi-folder ZIPs have path="" → omit the line.
+    var folderLine = t.path ? '<div class="t-folder"><span class="tf-ic">📁</span><span class="tf-path">'+escapeHtml(t.path)+'</span></div>' : '';
+    h+='<div class="transfer-item"><span class="t-icon">'+icon+'</span><div class="t-info"><div class="t-name">'+escapeHtml(t.name)+'</div>'+folderLine+'<div class="t-detail"><div class="t-bar"><div class="t-bar-fill '+cls+'" style="width:'+t.progress+'%"></div></div><span>'+escapeHtml(t.size)+'</span></div></div><span class="t-status '+(sDone?'done':'active')+'">'+(sDone?'✓':''+t.progress+'%')+'</span></div>';
   }
   c.innerHTML=h;
 }
@@ -2055,7 +2637,7 @@ def main():
     srv_thread = threading.Thread(target=srv.serve_forever, daemon=True)
     srv_thread.start()
 
-    print("🌊 OceanShare v5")
+    print("🌊 OceanShare v6")
     print(f"   http://localhost:{PORT}")
     if PORT != PREFERRED_PORT:
         print(f"   (porta {PREFERRED_PORT} ocupada, usando {PORT})")
